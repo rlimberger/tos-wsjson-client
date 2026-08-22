@@ -6,6 +6,7 @@ export * from "./client/types/alertTypes.js";
 export * from "./client/tdaWsJsonTypes.js";
 export * from "./client/wsJsonClientProxy.js";
 export * from "./client/messageTypeHelpers.js";
+export * from "./client/orders/paperMoneyFuturesOrderBuilder.js";
 export * from "./client/services/chartMessageHandler.js";
 export * from "./client/services/quotesMessageHandler.js";
 export * from "./client/services/positionsMessageHandler.js";

@@ -69,6 +69,11 @@ export const CONNECTION_REQUEST_MESSAGE = {
   heartbeat: "2s",
 };
 
+export const LIVE_WS_JSON_URL =
+  "wss://thinkorswim-services.schwab.com/Services/WsJson";
+export const PAPER_MONEY_WS_JSON_URL =
+  "wss://papermoney-services.schwab.com/Services/WsJson";
+
 export enum ChannelState {
   DISCONNECTED,
   CONNECTING,
@@ -77,6 +82,20 @@ export enum ChannelState {
 }
 
 const logger = debug("realWsJsonClient");
+
+function createSocket(url: string): WebSocket {
+  return new WebSocket(url, {
+    headers: {
+      Pragma: "no-cache",
+      Origin: "https://trade.thinkorswim.com",
+      Upgrade: "websocket",
+      "Cache-Control": "no-cache",
+      Connection: "Upgrade",
+      "Sec-WebSocket-Version": "13",
+      "Sec-WebSocket-Extensions": "permessage-deflate; client_max_window_bits",
+    },
+  });
+}
 
 const messageHandlers: WebSocketApiMessageHandler<never>[] = [
   new CancelAlertMessageHandler(),
@@ -114,23 +133,14 @@ export class RealWsJsonClient implements WsJsonClient {
   } = {};
 
   constructor(
-    private readonly socket = new WebSocket(
-      "wss://thinkorswim-services.schwab.com/Services/WsJson",
-      {
-        headers: {
-          Pragma: "no-cache",
-          Origin: "https://trade.thinkorswim.com",
-          Upgrade: "websocket",
-          "Cache-Control": "no-cache",
-          Connection: "Upgrade",
-          "Sec-WebSocket-Version": "13",
-          "Sec-WebSocket-Extensions":
-            "permessage-deflate; client_max_window_bits",
-        },
-      },
-    ),
+    private readonly socket = createSocket(LIVE_WS_JSON_URL),
     private readonly responseParser = new ResponseParser(this.genericHandler),
   ) {}
+
+  /** Creates a client that connects only to the paperMoney service. */
+  static forPaperMoney(): RealWsJsonClient {
+    return new RealWsJsonClient(createSocket(PAPER_MONEY_WS_JSON_URL));
+  }
 
   get accessToken() {
     return this.credentials.accessToken;

@@ -124,6 +124,35 @@ for await (const { body: event } of client.chart(chartRequest)) {
 
 For more sample usage check out https://github.com/huskly/tos-wsjson-client/blob/master/src/example/testApp.ts
 
+## paperMoney futures order scaffold
+
+Use the paperMoney factory to keep futures work separate from the live service.
+The order builder creates the confirmation and submission payloads but does not
+send them.
+
+```typescript
+import {
+  PaperMoneyFuturesOrderBuilder,
+  RealWsJsonClient,
+} from "tos-wsjson-client";
+
+const client = RealWsJsonClient.forPaperMoney();
+const order = new PaperMoneyFuturesOrderBuilder({
+  accountNumber: "123456789",
+  rootSymbol: "/ES",
+  contractSymbol: "/ESU26",
+  side: "BUY",
+  quantity: 1,
+  limitPrice: 6500.25,
+});
+
+const confirmationRequest = order.buildConfirmationRequest();
+const submissionRequest = order.buildSubmissionRequest(123456);
+```
+
+The submission request needs the draft order ID from the confirmation response.
+This first scaffold supports exact-contract, single-leg, day limit orders only.
+
 # Running tests
 
 `yarn test`
