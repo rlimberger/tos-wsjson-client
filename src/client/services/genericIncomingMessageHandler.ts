@@ -18,7 +18,7 @@ export default class GenericIncomingMessageHandler {
       const storeKey = `${service}_${id}_${ver}`;
       if (type === "snapshot") {
         this.dataStore[storeKey] = entry.body;
-        parsed.push({ service, body: entry.body });
+        parsed.push({ service, body: entry.body, id, ver, type });
       } else if (type === "patch") {
         const existingObject = this.dataStore[storeKey] || {};
         const body = entry.body as unknown as { patches: Operation[] };
@@ -29,7 +29,10 @@ export default class GenericIncomingMessageHandler {
           /* validateOperation */ false,
         );
         this.dataStore[storeKey] = newDocument;
-        parsed.push({ service, body: newDocument });
+        parsed.push({ service, body: newDocument, id, ver, type });
+      } else if (type === "error") {
+        // e.g. { message: "..." } — surface instead of dropping
+        parsed.push({ service, body: entry.body, id, ver, type });
       } else {
         console.warn(`Unknown message type: ${type}`);
       }

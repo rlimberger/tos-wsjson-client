@@ -131,3 +131,33 @@ For more sample usage check out https://github.com/huskly/tos-wsjson-client/blob
 # License
 
 MIT
+
+## Futures orders (PaperMoney scaffold)
+
+thinkorswim Web places futures through the same `place_order` flow as stocks
+(`requestType: "INIT_STOCK"` → `EDIT_ORDER`); the only futures-specific step is
+resolving a root (`/MES`) to a contract (`/MESU26`) via the `future_series`
+service. This fork adds:
+
+- `RealWsJsonClient.create({ tradingSystem: "PaperMoney" | "LiveTrading" })` —
+  resolves the gateway URL from `https://trade.thinkorswim.com/v1/api/config`.
+- `client.futureSeries(root)` — contracts for a root; `activeContract()` picks the one the UI trades.
+- `client.confirmOrder(...)` / `client.submitDraftOrder(...)` — generic CONFIRM/SUBMIT
+  builders supporting `LIMIT | MARKET | STOP | STOPLIMIT`, `tif`, `marker`, `refOrderId`.
+- `client.placeFuturesOrder(root, { accountNumber, side, quantity, orderType, limitPrice }, { dryRun })`
+  — resolve → CONFIRM → (SUBMIT). `dryRun` defaults to **true**.
+- Responses now carry `id`/`ver`/`type`, and handlers that declare `requestId()` only
+  receive responses for their own request id; `type: "error"` frames are surfaced.
+
+Example (paper money, confirm only; add `--submit` to send):
+
+```
+yarn build
+node --env-file=.env dist/example/futuresPaperOrder.js
+FUT_ROOT=/MES FUT_SIDE=BUY FUT_QTY=1 FUT_TYPE=LIMIT FUT_LIMIT=1000 \
+  node --env-file=.env dist/example/futuresPaperOrder.js --submit
+```
+
+Unverified against a live session yet: whether a token from the live gateway
+is accepted by the paper gateway (the web UI fetches a fresh authCode when
+switching), and the exact contract-symbol string returned by `future_series`.

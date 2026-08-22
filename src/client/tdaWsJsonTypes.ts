@@ -51,4 +51,10 @@ export type ParsedWebSocketResponse = MessageHandlerBaseResponse;
 export type ParsedPayloadResponse = {
   service: ApiService;
   body: Record<string, unknown>;
+  /** Request id echoed by the server (`header.id`); lets callers correlate
+   *  concurrent requests to the same service. */
+  id?: string;
+  ver?: number;
+  /** "snapshot" | "patch" | "error" */
+  type?: string;
 };

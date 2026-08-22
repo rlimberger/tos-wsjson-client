@@ -8,6 +8,10 @@ export default interface WebSocketApiMessageHandler<ReqType> {
 
   // Constructs a new message payload to be sent to the TDA websocket server
   buildRequest: (args: ReqType) => RawPayloadRequest;
+
+  // Optional: the header.id this handler uses for `args`. When provided, the
+  // client only routes responses carrying the same id back to the caller.
+  requestId?: (args: ReqType) => string;
 }
 
 export function newPayload(item: RawPayloadRequestItem) {

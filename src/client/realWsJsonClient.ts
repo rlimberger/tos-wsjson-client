@@ -44,6 +44,26 @@ import PlaceOrderMessageHandler, {
 import PositionsMessageHandler from "./services/positionsMessageHandler.js";
 import QuotesMessageHandler from "./services/quotesMessageHandler.js";
 import SchwabLoginMessageHandler from "./services/schwabLoginMessageHandler.js";
+import FutureSeriesMessageHandler, {
+  activeContract,
+  FutureSeriesRequest,
+  RawFutureSeriesItem,
+  RawFutureSeriesResponse,
+} from "./services/futureSeriesMessageHandler.js";
+import {
+  ConfirmOrderMessageHandler,
+  ConfirmOrderRequest,
+  draftProblems,
+  RawDraftOrderResponse,
+  SubmitDraftOrderMessageHandler,
+  SubmitOrderRequest,
+} from "./services/draftOrderMessageHandlers.js";
+import { OrderSpec } from "./services/orderTypes.js";
+import {
+  gatewayUrlFor,
+  newGatewaySocket,
+  TradingSystem,
+} from "./tosWebConfig.js";
 import SubmitOrderMessageHandler from "./services/submitOrderMessageHandler.js";
 import SubscribeToAlertMessageHandler from "./services/subscribeToAlertMessageHandler.js";
 import UserPropertiesMessageHandler from "./services/userPropertiesMessageHandler.js";
@@ -100,7 +120,19 @@ const messageHandlers: WebSocketApiMessageHandler<never>[] = [
   new SubmitOrderMessageHandler(),
   new MarketDepthMessageHandler(),
   new GetWatchlistMessageHandler(),
+  new FutureSeriesMessageHandler(),
+  new ConfirmOrderMessageHandler(),
+  new SubmitDraftOrderMessageHandler(),
 ];
+
+export type FuturesOrderResult = {
+  /** Contract actually used in the order legs (resolved from the root). */
+  contract: RawFutureSeriesItem;
+  /** CONFIRM response (draft): cost, allowed tifs/types, warnings, orderId. */
+  confirmation: RawDraftOrderResponse;
+  /** SUBMIT response; undefined when `dryRun` (CONFIRM only). */
+  submission?: RawDraftOrderResponse;
+};
 
 export class RealWsJsonClient implements WsJsonClient {
   private readonly genericHandler = new GenericIncomingMessageHandler();
@@ -131,6 +163,23 @@ export class RealWsJsonClient implements WsJsonClient {
     ),
     private readonly responseParser = new ResponseParser(this.genericHandler),
   ) {}
+
+  /**
+   * Creates a client connected to the gateway for the given trading system.
+   * Use "PaperMoney" to exercise the full order flow without risking capital —
+   * the paper gateway speaks the identical protocol.
+   */
+  static async create({
+    tradingSystem = "PaperMoney",
+    useInstanceB = false,
+  }: {
+    tradingSystem?: TradingSystem;
+    useInstanceB?: boolean;
+  } = {}): Promise<RealWsJsonClient> {
+    const url = await gatewayUrlFor(tradingSystem, { useInstanceB });
+    logger("connecting to %s gateway %s", tradingSystem, url);
+    return new RealWsJsonClient(newGatewaySocket(url));
+  }
 
   get accessToken() {
     return this.credentials.accessToken;
@@ -321,6 +370,87 @@ export class RealWsJsonClient implements WsJsonClient {
     return this.dispatchHandler(SubmitOrderMessageHandler, request).promise();
   }
 
+  /** Lists the tradeable contracts for a futures root such as "/MES". */
+  async futureSeries(root: string): Promise<RawFutureSeriesItem[]> {
+    const req: FutureSeriesRequest = { root };
+    const res = await this.dispatchHandler(
+      FutureSeriesMessageHandler,
+      req,
+    ).promise();
+    return (res.body as unknown as RawFutureSeriesResponse).series ?? [];
+  }
+
+  /** Phase 1 of the order flow: creates/validates a draft on the server. */
+  async confirmOrder(
+    request: ConfirmOrderRequest,
+  ): Promise<RawDraftOrderResponse> {
+    const res = await this.dispatchHandler(
+      ConfirmOrderMessageHandler,
+      request,
+    ).promise();
+    return res.body as RawDraftOrderResponse;
+  }
+
+  /** Phase 2 of the order flow: sends the draft (or replaces a live order). */
+  async submitDraftOrder(
+    request: SubmitOrderRequest,
+  ): Promise<RawDraftOrderResponse> {
+    const res = await this.dispatchHandler(
+      SubmitDraftOrderMessageHandler,
+      request,
+    ).promise();
+    return res.body as RawDraftOrderResponse;
+  }
+
+  /**
+   * Places a futures order the way the ToS Web UI does:
+   * resolve root -> active contract (future_series), CONFIRM with INIT_STOCK,
+   * then SUBMIT with EDIT_ORDER. With `dryRun` (default) it stops after CONFIRM.
+   */
+  async placeFuturesOrder(
+    root: string,
+    spec: Omit<OrderSpec, "legs" | "draftKey"> & {
+      side: "BUY" | "SELL";
+      quantity: number;
+      /** Trade a specific contract instead of the active one. */
+      contract?: string;
+    },
+    { dryRun = true }: { dryRun?: boolean } = {},
+  ): Promise<FuturesOrderResult> {
+    const series = await this.futureSeries(root);
+    const contract = spec.contract
+      ? series.find((s) => s.symbol === spec.contract)
+      : activeContract(series);
+    if (!contract) {
+      throw new Error(
+        `no tradeable contract for ${root} (${spec.contract ?? "active"})`,
+      );
+    }
+    const { side, quantity, contract: _c, ...rest } = spec;
+    const orderSpec: OrderSpec = {
+      ...rest,
+      draftKey: root,
+      legs: [{ symbol: contract.symbol, quantity, side }],
+    };
+    const confirmation = await this.confirmOrder({ spec: orderSpec });
+    const problems = draftProblems(confirmation);
+    if (problems.length) {
+      throw new Error(`CONFIRM rejected: ${problems.join("; ")}`);
+    }
+    if (dryRun) return { contract, confirmation };
+    const draft = confirmation.orders?.[0];
+    const tif =
+      orderSpec.tif ??
+      (draft?.tifs
+        ? (draft.tifs.values[draft.tifs.selection] as OrderSpec["tif"])
+        : "DAY");
+    const submission = await this.submitDraftOrder({
+      spec: { ...orderSpec, tif },
+      refOrderId: draft?.orderId,
+    });
+    return { contract, confirmation, submission };
+  }
+
   workingOrders(accountNumber: string): AsyncIterable<ParsedPayloadResponse> {
     const handler = new WorkingOrdersMessageHandler();
     return this.dispatch(handler, accountNumber).iterable();
@@ -364,8 +494,11 @@ export class RealWsJsonClient implements WsJsonClient {
   ): Observable<NonNullable<ParsedPayloadResponse>> {
     this.ensureConnected();
     this.sendMessage(handler.buildRequest(args));
+    const wantId = handler.requestId?.(args);
     return deferredWrap(() => this.iterator).filter(
-      (msg) => msg.service === handler.service,
+      (msg) =>
+        msg.service === handler.service &&
+        (wantId === undefined || msg.id === undefined || msg.id === wantId),
     ) as Observable<NonNullable<ParsedPayloadResponse>>;
   }
 

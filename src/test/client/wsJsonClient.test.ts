@@ -170,6 +170,9 @@ describe("wsJsonClientTest", () => {
       expect(response).toEqual({
         body: { someMagicNumber: 42 },
         service: "fake",
+        id: "fake",
+        ver: 0,
+        type: "snapshot",
       });
     } finally {
       client.disconnect();

@@ -19,4 +19,6 @@ export type ApiService =
   | "optionSeries/quotes"
   | "market_depth"
   | "watchlist/get"
+  | "future_series"
+  | "instruments"
   | "fake"; // testing only
