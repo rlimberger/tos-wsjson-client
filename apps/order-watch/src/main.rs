@@ -1,372 +1,322 @@
-//! Working-order watcher for thinkorswim PaperMoney.
-//!
-//! Spawns the Node `orderWatcher` sidecar (same session as `.env`) and keeps
-//! a table in sync with `order_events`. Cancelling an order in the web UI
-//! removes the row when the CANCELED/FINAL frame arrives.
+//! Working-order watcher. Never talks to Schwab: `orderFeedServer.js` owns
+//! the authenticated session and broadcasts the book over localhost WebSocket.
+//! A cancel or fill made in the ToS web UI reaches this window through the
+//! same `order_events` stream and the row disappears or updates.
 
-use anyhow::{Context as _, Result};
-use gpui::*;
+mod feed;
+
+use std::sync::mpsc::{channel, Receiver};
+use std::time::Duration;
+
+use feed::{FeedEvent, FeedMessage, Order};
+use gpui::{prelude::FluentBuilder as _, *};
 use gpui_component::{
-    h_flex,
-    status_bar::StatusBar,
-    table::{Table, TableBody, TableCell, TableHead, TableHeader, TableRow},
-    tag::Tag,
-    v_flex, ActiveTheme, Root, TitleBar, WindowOptions,
-};
-use serde::Deserialize;
-use std::{
-    io::{BufRead, BufReader},
-    path::PathBuf,
-    process::{Command, Stdio},
-    thread,
+    table::{Column, DataTable, TableDelegate, TableState},
+    ActiveTheme as _, StyledExt as _, *,
 };
 
-#[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct DisplayOrder {
-    order_id: i64,
-    symbol: String,
-    side: String,
-    quantity: f64,
-    filled_quantity: f64,
-    remaining: f64,
-    order_type: String,
-    limit_price: Option<f64>,
-    tif: Option<String>,
-    status: String,
-    cancelable: bool,
+/// How often the UI drains the feed thread's channel.
+const POLL_INTERVAL: Duration = Duration::from_millis(120);
+
+#[derive(Clone, Copy, PartialEq)]
+enum Link {
+    Connecting,
+    Up,
+    Down,
 }
 
-#[derive(Debug, Deserialize)]
-struct Envelope {
-    #[serde(flatten)]
-    body: WatcherMsg,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type")]
-enum WatcherMsg {
-    #[serde(rename = "hello")]
-    Hello {
-        account: String,
-        #[serde(rename = "tradingSystem")]
-        trading_system: String,
-        #[serde(rename = "gatewayUrl")]
-        gateway_url: String,
-    },
-    #[serde(rename = "connection")]
-    Connection {
-        state: String,
-        attempt: Option<u32>,
-        #[serde(rename = "delayMs")]
-        delay_ms: Option<u64>,
-        reason: Option<String>,
-    },
-    #[serde(rename = "orders")]
-    Orders { orders: Vec<DisplayOrder> },
-    #[serde(rename = "error")]
-    Error { message: String },
-}
-
-struct OrderWatch {
-    account: SharedString,
-    connection: SharedString,
-    error: Option<SharedString>,
-    orders: Vec<DisplayOrder>,
-}
-
-impl OrderWatch {
-    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let (tx, rx) = smol::channel::unbounded::<WatcherMsg>();
-        match spawn_sidecar(tx.clone()) {
-            Ok(()) => {}
-            Err(err) => {
-                let _ = tx.send_blocking(WatcherMsg::Error {
-                    message: format!("{err:#}"),
-                });
-            }
+impl Link {
+    fn label(self) -> &'static str {
+        match self {
+            Link::Connecting => "connecting",
+            Link::Up => "live",
+            Link::Down => "disconnected",
         }
+    }
+}
+
+struct OrdersTable {
+    columns: Vec<Column>,
+    orders: Vec<Order>,
+}
+
+impl OrdersTable {
+    fn new() -> Self {
+        Self {
+            columns: vec![
+                Column::new("id", "Order").width(px(110.)),
+                Column::new("symbol", "Contract").width(px(140.)),
+                Column::new("side", "Side").width(px(60.)),
+                Column::new("qty", "Qty").width(px(90.)),
+                Column::new("price", "Price").width(px(100.)),
+                Column::new("type", "Type").width(px(90.)),
+                Column::new("tif", "TIF").width(px(70.)),
+                Column::new("status", "Status").width(px(100.)),
+            ],
+            orders: Vec::new(),
+        }
+    }
+}
+
+fn fmt_qty(o: &Order) -> String {
+    if o.filled_quantity > 0.0 {
+        format!("{}/{}", o.filled_quantity, o.quantity)
+    } else {
+        format!("{}", o.quantity)
+    }
+}
+
+fn fmt_price(o: &Order) -> String {
+    match o.limit_price {
+        Some(p) => format!("{p:.2}"),
+        None => "—".to_string(),
+    }
+}
+
+impl TableDelegate for OrdersTable {
+    fn columns_count(&self, _: &App) -> usize {
+        self.columns.len()
+    }
+
+    fn rows_count(&self, _: &App) -> usize {
+        self.orders.len()
+    }
+
+    fn column(&self, col_ix: usize, _: &App) -> Column {
+        self.columns[col_ix].clone()
+    }
+
+    fn render_td(
+        &mut self,
+        row_ix: usize,
+        col_ix: usize,
+        _: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> impl IntoElement {
+        let Some(order) = self.orders.get(row_ix) else {
+            return div().into_any_element();
+        };
+        // Side is the one place color carries meaning.
+        let buy = order.side.eq_ignore_ascii_case("BUY");
+        match col_ix {
+            0 => format!("{}", order.order_id).into_any_element(),
+            1 => order.symbol.clone().into_any_element(),
+            2 => div()
+                .text_color(if buy {
+                    cx.theme().green
+                } else {
+                    cx.theme().red
+                })
+                .child(order.side.clone())
+                .into_any_element(),
+            3 => fmt_qty(order).into_any_element(),
+            4 => fmt_price(order).into_any_element(),
+            5 => order.order_type.clone().into_any_element(),
+            6 => order.tif.clone().unwrap_or_default().into_any_element(),
+            7 => order.status.clone().into_any_element(),
+            _ => div().into_any_element(),
+        }
+    }
+}
+
+struct Watcher {
+    table: Entity<TableState<OrdersTable>>,
+    rx: Receiver<FeedEvent>,
+    account: Option<String>,
+    trading_system: Option<String>,
+    gateway_state: String,
+    link: Link,
+    last_error: Option<String>,
+    order_count: usize,
+}
+
+impl Watcher {
+    fn new(rx: Receiver<FeedEvent>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let table = cx.new(|cx| TableState::new(OrdersTable::new(), window, cx));
 
         cx.spawn(async move |this, cx| {
-            while let Ok(msg) = rx.recv().await {
-                if this
-                    .update(cx, |this, cx| {
-                        this.apply(msg);
-                        cx.notify();
-                    })
-                    .is_err()
-                {
+            loop {
+                cx.background_executor().timer(POLL_INTERVAL).await;
+                if this.update(cx, |this, cx| this.drain(cx)).is_err() {
                     break;
                 }
             }
         })
         .detach();
 
-        let _ = window;
         Self {
-            account: "connecting…".into(),
-            connection: "starting".into(),
-            error: None,
-            orders: Vec::new(),
+            table,
+            rx,
+            account: None,
+            trading_system: None,
+            gateway_state: "unknown".into(),
+            link: Link::Connecting,
+            last_error: None,
+            order_count: 0,
         }
     }
 
-    fn apply(&mut self, msg: WatcherMsg) {
-        match msg {
-            WatcherMsg::Hello {
-                account,
-                trading_system,
-                ..
-            } => {
-                self.account = format!("{trading_system}  {account}").into();
-                self.connection = "connected".into();
-                self.error = None;
+    fn drain(&mut self, cx: &mut Context<Self>) {
+        let mut dirty = false;
+        while let Ok(event) = self.rx.try_recv() {
+            dirty = true;
+            match event {
+                FeedEvent::Message(FeedMessage::Session {
+                    account,
+                    trading_system,
+                }) => {
+                    self.account = Some(account);
+                    self.trading_system = Some(trading_system);
+                }
+                FeedEvent::Message(FeedMessage::Orders { orders }) => {
+                    self.order_count = orders.len();
+                    self.table.update(cx, |state, cx| {
+                        state.delegate_mut().orders = orders;
+                        state.refresh(cx);
+                    });
+                }
+                FeedEvent::Message(FeedMessage::Connection { state }) => {
+                    self.gateway_state = state;
+                }
+                FeedEvent::BridgeUp => {
+                    self.link = Link::Up;
+                    self.last_error = None;
+                }
+                FeedEvent::BridgeDown(err) => {
+                    self.link = Link::Down;
+                    self.last_error = Some(err);
+                    self.table.update(cx, |state, cx| {
+                        state.delegate_mut().orders.clear();
+                        state.refresh(cx);
+                    });
+                    self.order_count = 0;
+                }
             }
-            WatcherMsg::Connection { state, attempt, .. } => {
-                self.connection = match (state.as_str(), attempt) {
-                    ("reconnecting", Some(n)) => format!("reconnecting ({n})").into(),
-                    (other, _) => other.to_string().into(),
-                };
-            }
-            WatcherMsg::Orders { orders } => {
-                self.orders = orders;
-            }
-            WatcherMsg::Error { message } => {
-                self.error = Some(message.into());
-                self.connection = "error".into();
-            }
+        }
+        if dirty {
+            cx.notify();
         }
     }
 
-    fn status_tag(&self) -> Tag {
-        match self.connection.to_string().as_str() {
-            "connected" => Tag::success().small().child("connected"),
-            s if s.starts_with("reconnecting") => Tag::warning().small().child(s.to_string()),
-            "error" | "gaveUp" | "disconnected" => {
-                Tag::danger().small().child(self.connection.clone())
-            }
-            other => Tag::secondary().small().child(other.to_string()),
-        }
+    fn status_dot(&self, cx: &App) -> Div {
+        let color = match self.link {
+            Link::Up if self.gateway_state == "connected" => cx.theme().green,
+            Link::Up => cx.theme().yellow,
+            Link::Connecting => cx.theme().yellow,
+            Link::Down => cx.theme().red,
+        };
+        div().size_2().rounded_full().bg(color)
+    }
+
+    fn header(&self, cx: &App) -> impl IntoElement {
+        let account = self.account.clone().unwrap_or_else(|| "—".into());
+        let system = self.trading_system.clone().unwrap_or_else(|| "—".into());
+        h_flex()
+            .w_full()
+            .px_3()
+            .py_2()
+            .gap_3()
+            .items_center()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .child(self.status_dot(cx))
+            .child(div().font_semibold().child("Working orders"))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(format!("{system} · {account}")),
+            )
+            .child(div().flex_1())
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(format!(
+                        "{} order{} · bridge {} · gateway {}",
+                        self.order_count,
+                        if self.order_count == 1 { "" } else { "s" },
+                        self.link.label(),
+                        self.gateway_state
+                    )),
+            )
+    }
+
+    fn empty_state(&self, cx: &App) -> impl IntoElement {
+        let message = match (self.link, self.last_error.as_ref()) {
+            (Link::Down, Some(err)) => format!("Bridge unreachable — {err}"),
+            (Link::Down, None) => "Bridge unreachable".to_string(),
+            (Link::Connecting, _) => "Connecting to the order feed…".to_string(),
+            (Link::Up, _) => "No working orders".to_string(),
+        };
+        v_flex()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .gap_1()
+            .child(
+                div()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(message),
+            )
+            .when(self.link == Link::Down, |this| {
+                this.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(
+                            "start it with: node --env-file=.env dist/example/orderFeedServer.js",
+                        ),
+                )
+            })
     }
 }
 
-impl Render for OrderWatch {
+impl Render for Watcher {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let has_rows = self.order_count > 0;
         v_flex()
             .size_full()
             .bg(cx.theme().background)
-            .child(
-                TitleBar::new().child(
-                    h_flex()
-                        .w_full()
-                        .px_3()
-                        .justify_between()
-                        .child("Order Watch")
-                        .child(self.status_tag()),
-                ),
-            )
+            .text_color(cx.theme().foreground)
+            .child(self.header(cx))
             .child(
                 div()
-                    .id("orders")
                     .flex_1()
-                    .min_h_0()
-                    .p_4()
-                    .child(self.render_table(cx)),
+                    .w_full()
+                    .when(has_rows, |this| {
+                        this.child(DataTable::new(&self.table).stripe(true).bordered(false))
+                    })
+                    .when(!has_rows, |this| this.child(self.empty_state(cx))),
             )
-            .children(self.error.clone().map(|err| {
-                div()
-                    .px_4()
-                    .pb_2()
-                    .text_color(cx.theme().danger)
-                    .child(err)
-            }))
-            .child(
-                StatusBar::new()
-                    .left(self.account.clone())
-                    .child(format!("{} working", self.orders.len()))
-                    .right(self.connection.clone()),
-            )
-            .children(Root::render_notification_layer(cx))
     }
-}
-
-impl OrderWatch {
-    fn render_table(&self, cx: &App) -> impl IntoElement {
-        if self.orders.is_empty() {
-            return v_flex()
-                .size_full()
-                .items_center()
-                .justify_center()
-                .gap_2()
-                .text_color(cx.theme().muted_foreground)
-                .child("No working orders")
-                .child("Place or cancel in thinkorswim Web — this table follows order_events.")
-                .into_any_element();
-        }
-
-        let header = TableHeader::new().child(
-            TableRow::new()
-                .child(TableHead::new().w(px(108.)).child("Order"))
-                .child(TableHead::new().w(px(72.)).child("Side"))
-                .child(TableHead::new().child("Symbol"))
-                .child(TableHead::new().w(px(88.)).text_right().child("Qty"))
-                .child(TableHead::new().w(px(88.)).text_right().child("Filled"))
-                .child(TableHead::new().w(px(88.)).text_right().child("Limit"))
-                .child(TableHead::new().w(px(72.)).child("TIF"))
-                .child(TableHead::new().w(px(100.)).child("Status")),
-        );
-
-        let rows = self.orders.iter().map(|order| {
-            let side_tag = if order.side.eq_ignore_ascii_case("SELL") {
-                Tag::danger().small().outline().child(order.side.clone())
-            } else {
-                Tag::success().small().outline().child(order.side.clone())
-            };
-            TableRow::new()
-                .child(TableCell::new().w(px(108.)).child(order.order_id.to_string()))
-                .child(TableCell::new().w(px(72.)).child(side_tag))
-                .child(TableCell::new().child(order.symbol.clone()))
-                .child(
-                    TableCell::new()
-                        .w(px(88.))
-                        .text_right()
-                        .child(format_qty(order.remaining)),
-                )
-                .child(
-                    TableCell::new()
-                        .w(px(88.))
-                        .text_right()
-                        .child(format_qty(order.filled_quantity)),
-                )
-                .child(
-                    TableCell::new()
-                        .w(px(88.))
-                        .text_right()
-                        .child(
-                            order
-                                .limit_price
-                                .map(|p| format!("{p}"))
-                                .unwrap_or_else(|| "—".into()),
-                        ),
-                )
-                .child(
-                    TableCell::new()
-                        .w(px(72.))
-                        .child(order.tif.clone().unwrap_or_default()),
-                )
-                .child(
-                    TableCell::new()
-                        .w(px(100.))
-                        .child(Tag::info().small().child(order.status.clone())),
-                )
-        });
-
-        Table::new()
-            .w_full()
-            .child(header)
-            .child(TableBody::new().children(rows))
-            .into_any_element()
-    }
-}
-
-fn format_qty(n: f64) -> String {
-    if n.fract() == 0.0 {
-        format!("{n:.0}")
-    } else {
-        format!("{n}")
-    }
-}
-
-fn spawn_sidecar(tx: smol::channel::Sender<WatcherMsg>) -> Result<()> {
-    let script = watcher_script()?;
-    let repo = script
-        .parent()
-        .and_then(|p| p.parent())
-        .and_then(|p| p.parent())
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."));
-    let mut child = Command::new("node")
-        .arg("--env-file=.env")
-        .arg(&script)
-        .current_dir(&repo)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("spawn node {}", script.display()))?;
-
-    let stdout = child.stdout.take().context("sidecar stdout")?;
-    let stderr = child.stderr.take().context("sidecar stderr")?;
-
-    thread::spawn(move || {
-        let reader = BufReader::new(stdout);
-        for line in reader.lines() {
-            let Ok(line) = line else { break };
-            if line.trim().is_empty() {
-                continue;
-            }
-            match serde_json::from_str::<Envelope>(&line) {
-                Ok(env) => {
-                    if tx.send_blocking(env.body).is_err() {
-                        break;
-                    }
-                }
-                Err(err) => {
-                    let _ = tx.send_blocking(WatcherMsg::Error {
-                        message: format!("bad sidecar line: {err}"),
-                    });
-                }
-            }
-        }
-        let _ = child.wait();
-        let _ = tx.send_blocking(WatcherMsg::Error {
-            message: "order watcher exited".into(),
-        });
-    });
-
-    thread::spawn(move || {
-        let reader = BufReader::new(stderr);
-        for line in reader.lines().flatten() {
-            eprintln!("[orderWatcher] {line}");
-        }
-    });
-
-    Ok(())
-}
-
-fn watcher_script() -> Result<PathBuf> {
-    if let Ok(p) = std::env::var("ORDER_WATCHER_JS") {
-        return Ok(PathBuf::from(p));
-    }
-    let from_crate = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../dist/example/orderWatcher.js");
-    if from_crate.exists() {
-        return Ok(from_crate.canonicalize()?);
-    }
-    let from_cwd = std::env::current_dir()?.join("dist/example/orderWatcher.js");
-    if from_cwd.exists() {
-        return Ok(from_cwd);
-    }
-    anyhow::bail!(
-        "orderWatcher.js not found; run `npx tsc -p tsconfig.json` in tos-wsjson-client"
-    );
 }
 
 fn main() {
-    let app = gpui_platform::application().with_assets(gpui_component_assets::Assets);
+    let url = std::env::var("TOS_FEED_URL").unwrap_or_else(|_| feed::DEFAULT_FEED_URL.to_string());
+    let (tx, rx) = channel();
+    feed::spawn(url, tx);
 
-    app.run(move |cx| {
+    gpui_platform::application().run(move |cx| {
         gpui_component::init(cx);
-
         cx.spawn(async move |cx| {
-            let mut options = TitleBar::window_options();
-            options.window_bounds = Some(WindowBounds::centered(size(px(980.), px(560.)), cx));
-            options.window_min_size = Some(size(px(640.), px(360.)));
-
-            cx.open_window(options, |window, cx| {
-                window.set_window_title("Order Watch");
-                let view = cx.new(|cx| OrderWatch::new(window, cx));
-                cx.new(|cx| Root::new(view, window, cx).bg(cx.theme().background))
-            })
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: point(px(120.), px(120.)),
+                        size: size(px(880.), px(420.)),
+                    })),
+                    titlebar: Some(TitlebarOptions {
+                        title: Some("thinkorswim — working orders".into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                |window, cx| {
+                    let view = cx.new(|cx| Watcher::new(rx, window, cx));
+                    cx.new(|cx| Root::new(view, window, cx).bg(cx.theme().background))
+                },
+            )
             .expect("failed to open window");
         })
         .detach();

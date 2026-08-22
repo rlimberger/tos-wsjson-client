@@ -110,13 +110,13 @@ const draft = await client.futuresOrderBuilder().confirm("/MES", {
 
 # Working-order watcher
 
-A heartbeat watchdog keeps the PaperMoney socket alive (30s of silence → reconnect, replay `order_events`, up to 3 attempts). The GPUI window shows **working** orders only: a cancel or fill from thinkorswim Web drops the row when the matching event arrives.
+The Node **order-feed bridge** owns the PaperMoney session and the heartbeat watchdog (30s of silence → reconnect, replay `order_events`). The GPUI window is a reconnecting client of `ws://127.0.0.1:8787` and never holds the token. A cancel or fill from thinkorswim Web drops the row when the matching event arrives.
 
 ```
-# sidecar only (NDJSON on stdout)
-node --env-file=.env dist/example/orderWatcher.js
+# 1. session owner (keep this running)
+node --env-file=.env dist/example/orderFeedServer.js
 
-# desktop window (spawns the sidecar)
+# 2. desktop window
 cargo run --manifest-path apps/order-watch/Cargo.toml --release
 ```
 
