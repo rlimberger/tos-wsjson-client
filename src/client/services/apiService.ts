@@ -21,5 +21,8 @@ export type ApiService =
   | "watchlist/get"
   | "future_series"
   | "accounts"
+  | "order_history"
+  | "trade_history"
+  | "statement"
   | "instruments"
   | "fake"; // testing only

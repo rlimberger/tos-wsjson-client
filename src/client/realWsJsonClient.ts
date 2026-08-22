@@ -45,6 +45,18 @@ import PlaceOrderMessageHandler, {
 import PositionsMessageHandler from "./services/positionsMessageHandler.js";
 import QuotesMessageHandler from "./services/quotesMessageHandler.js";
 import SchwabLoginMessageHandler from "./services/schwabLoginMessageHandler.js";
+import {
+  HistoryRequest,
+  OrderHistoryMessageHandler,
+  RawOrderHistoryEntry,
+  RawOrderHistoryResponse,
+  RawStatementResponse,
+  RawTradeHistoryEntry,
+  RawTradeHistoryResponse,
+  StatementMessageHandler,
+  TradeHistoryMessageHandler,
+  tradingDayRange,
+} from "./services/historyMessageHandlers.js";
 import AccountsMessageHandler, {
   accountCodeOf,
   RawAccountItem,
@@ -163,6 +175,9 @@ const messageHandlers: WebSocketApiMessageHandler<never>[] = [
   new GetWatchlistMessageHandler(),
   new FutureSeriesMessageHandler(),
   new AccountsMessageHandler(),
+  new OrderHistoryMessageHandler(),
+  new TradeHistoryMessageHandler(),
+  new StatementMessageHandler(),
   new ConfirmOrderMessageHandler(),
   new SubmitDraftOrderMessageHandler(),
 ];
@@ -444,6 +459,60 @@ export class RealWsJsonClient implements WsJsonClient {
     request: Required<PlaceLimitOrderRequestParams>,
   ): Promise<ParsedPayloadResponse> {
     return this.dispatchHandler(SubmitOrderMessageHandler, request).promise();
+  }
+
+  /**
+   * Orders placed in a date range (default: the current trading day), as the
+   * gateway records them — including ones that filled or were cancelled before
+   * any live subscription saw them.
+   */
+  async orderHistory(
+    accountNumber: string,
+    range: Partial<HistoryRequest> = {},
+  ): Promise<RawOrderHistoryEntry[]> {
+    const { startTime, endTime } = { ...tradingDayRange(), ...range };
+    const res = await this.dispatchHandler(OrderHistoryMessageHandler, {
+      accountNumber,
+      startTime,
+      endTime,
+    }).promise();
+    const body = res.body as unknown as RawOrderHistoryResponse;
+    if (body.error) throw new Error(`order_history: ${body.error}`);
+    return body.orderHistoryEntries ?? [];
+  }
+
+  /** Executions in a date range (default: the current trading day). */
+  async tradeHistory(
+    accountNumber: string,
+    range: Partial<HistoryRequest> = {},
+  ): Promise<RawTradeHistoryEntry[]> {
+    const { startTime, endTime } = { ...tradingDayRange(), ...range };
+    const res = await this.dispatchHandler(TradeHistoryMessageHandler, {
+      accountNumber,
+      startTime,
+      endTime,
+    }).promise();
+    const body = res.body as unknown as RawTradeHistoryResponse;
+    if (body.error) throw new Error(`trade_history: ${body.error}`);
+    return body.tradeHistoryEntries ?? [];
+  }
+
+  /** Account values (net liq, cash, buying power) computed by the server. */
+  statement(accountNumber: string): AsyncIterable<ParsedPayloadResponse> {
+    return this.dispatchHandler(
+      StatementMessageHandler,
+      accountNumber,
+    ).iterable();
+  }
+
+  async statementSnapshot(
+    accountNumber: string,
+  ): Promise<RawStatementResponse> {
+    const res = await this.dispatchHandler(
+      StatementMessageHandler,
+      accountNumber,
+    ).promise();
+    return res.body as unknown as RawStatementResponse;
   }
 
   /** Lists the accounts on the connected (live or paper) session. */
