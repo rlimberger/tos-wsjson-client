@@ -71,6 +71,7 @@ export default class PositionsMessageHandler implements WebSocketApiMessageHandl
           "PL_OPEN",
           "PL_YTD",
           "PL_DAY",
+          "MARK",
         ],
       },
     });

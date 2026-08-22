@@ -9,12 +9,19 @@
  * Wire protocol (one JSON object per WebSocket text frame):
  *   { "type": "session", "account": "D-…", "tradingSystem": "PaperMoney" }
  *   { "type": "orders",  "orders": [ …OrderRow… ], "at": 1690000000000 }
+ *   { "type": "fills",   "fills": [ …Fill… ], "at": … }
+ *   { "type": "positions", "positions": [ …PositionRow… ], "at": … }
  *   { "type": "connection", "state": "connected" | "reconnecting" | "disconnected" | "gaveUp" }
  * A fresh client immediately receives `session`, the latest `orders`, and the
  * current `connection` state.
  */
 import { WebSocketServer, WebSocket as WsSocket } from "ws";
 import { RealWsJsonClient } from "../client/realWsJsonClient.js";
+import { Fill, FillLog } from "../client/orders/fills.js";
+import {
+  PositionRow,
+  positionsFromBody,
+} from "../client/orders/positionsBook.js";
 import {
   DisplayOrder,
   ordersFromEventsBody,
@@ -46,6 +53,9 @@ export async function startOrderFeedServer(port = 8787) {
   const clients = new Set<WsSocket>();
   let connectionState = "connecting";
   let latestOrders: DisplayOrder[] = [];
+  let latestFills: Fill[] = [];
+  let latestPositions: PositionRow[] = [];
+  const fillLog = new FillLog();
 
   const broadcast = (msg: unknown) => {
     const data = JSON.stringify(msg);
@@ -97,6 +107,16 @@ export async function startOrderFeedServer(port = 8787) {
         at: Date.now(),
       }),
     );
+    ws.send(
+      JSON.stringify({ type: "fills", fills: latestFills, at: Date.now() }),
+    );
+    ws.send(
+      JSON.stringify({
+        type: "positions",
+        positions: latestPositions,
+        at: Date.now(),
+      }),
+    );
     ws.send(JSON.stringify({ type: "connection", state: connectionState }));
     ws.on("close", () => clients.delete(ws));
   });
@@ -107,9 +127,32 @@ export async function startOrderFeedServer(port = 8787) {
 
   void (async () => {
     for await (const ev of client.orderEvents(account)) {
+      const orders = (ev.body.orders ?? []) as Parameters<FillLog["apply"]>[0];
       latestOrders = ordersFromEventsBody(ev.body);
       broadcast({ type: "orders", orders: latestOrders, at: Date.now() });
-      console.log(`[feed] ${latestOrders.length} working order(s)`);
+
+      // A marketable order can fill without ever appearing as WORKING, so the
+      // fill log is the only place that order becomes visible.
+      const before = latestFills.length;
+      latestFills = fillLog.apply(orders);
+      if (latestFills.length !== before) {
+        broadcast({ type: "fills", fills: latestFills, at: Date.now() });
+      }
+      console.log(
+        `[feed] ${latestOrders.length} working order(s), ${latestFills.length} fill(s)`,
+      );
+    }
+  })();
+
+  void (async () => {
+    for await (const ev of client.accountPositions(account)) {
+      latestPositions = positionsFromBody(ev.body);
+      broadcast({
+        type: "positions",
+        positions: latestPositions,
+        at: Date.now(),
+      });
+      console.log(`[feed] ${latestPositions.length} position(s)`);
     }
   })();
 

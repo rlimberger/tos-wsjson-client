@@ -49,6 +49,8 @@ export type RawOrderEvent = {
   sellOut: boolean;
   quantity: number;
   filledQuantity: number;
+  /** Average execution price; present on EXECUTION/FILLED events. */
+  avgFillPrice: number;
   limitPrice: number;
   priceType: string;
   price: number;

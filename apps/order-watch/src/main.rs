@@ -220,7 +220,7 @@ impl Watcher {
             .border_b_1()
             .border_color(cx.theme().border)
             .child(self.status_dot(cx))
-            .child(div().font_semibold().child("Working orders"))
+            .child(div().font_semibold().child("Working orders (grok)"))
             .child(
                 div()
                     .text_sm()
@@ -303,11 +303,11 @@ fn main() {
             cx.open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(Bounds {
-                        origin: point(px(120.), px(120.)),
+                        origin: point(px(200.), px(180.)),
                         size: size(px(880.), px(420.)),
                     })),
                     titlebar: Some(TitlebarOptions {
-                        title: Some("thinkorswim — working orders".into()),
+                        title: Some("grok — working orders".into()),
                         ..Default::default()
                     }),
                     ..Default::default()
