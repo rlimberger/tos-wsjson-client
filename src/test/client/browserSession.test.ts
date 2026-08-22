@@ -1,4 +1,7 @@
-import { sessionFromEnv } from "../../example/browserSession";
+import {
+  parseTradingSystem,
+  sessionFromEnv,
+} from "../../example/browserSession";
 
 describe("browserSession env round-trip", () => {
   it("reads a captured session from env", () => {
@@ -12,5 +15,13 @@ describe("browserSession env round-trip", () => {
       accountCode: "123",
     });
     expect(sessionFromEnv({} as NodeJS.ProcessEnv)).toBeUndefined();
+  });
+
+  it("parses SPA trading-system storage values", () => {
+    expect(parseTradingSystem("PaperMoney")).toBe("PaperMoney");
+    expect(parseTradingSystem("traderx::papermoney")).toBe("PaperMoney");
+    expect(parseTradingSystem("LiveTrading")).toBe("LiveTrading");
+    expect(parseTradingSystem("traderx::live")).toBe("LiveTrading");
+    expect(parseTradingSystem(undefined)).toBeUndefined();
   });
 });

@@ -146,24 +146,59 @@ async function main() {
     `connected: ${session.tradingSystem} ${session.gatewayUrl} account ${accountNumber}`,
   );
 
+  if (env.TOS_CANCEL) {
+    const orderId = Number(env.TOS_CANCEL);
+    const res = await client.cancelOrder(orderId);
+    console.log("CANCEL:", JSON.stringify(res.body, null, 2));
+    client.disconnect();
+    return;
+  }
+
+  type LiveOrder = {
+    orderId?: number;
+    status?: string;
+    eventType?: string;
+    side?: string;
+    quantity?: number;
+    price?: number;
+    tif?: string;
+    legs?: { symbol?: string }[];
+    descriptionToShare?: string;
+  };
+  const seenOrders: LiveOrder[] = [];
   const events = client.orderEvents(accountNumber);
   void (async () => {
     for await (const ev of events) {
-      const orders =
-        (ev.body.orders as {
-          orderId?: number;
-          status?: string;
-          eventType?: string;
-        }[]) ?? [];
-      for (const o of orders) {
-        console.log("order-event", {
-          orderId: o.orderId,
-          status: o.status,
-          eventType: o.eventType,
-        });
+      for (const o of (ev.body.orders as LiveOrder[]) ?? []) {
+        seenOrders.push(o);
+        if (verbose) {
+          console.log("order-event", {
+            orderId: o.orderId,
+            status: o.status,
+            eventType: o.eventType,
+          });
+        }
       }
     }
   })();
+
+  /** The submit response echoes the draft (orderId 0); the real id arrives via order_events. */
+  const awaitPlacedOrder = async (
+    contract: string,
+    timeoutMs = 10_000,
+  ): Promise<LiveOrder | undefined> => {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const match = seenOrders.find(
+        (o) =>
+          o.orderId &&
+          (o.legs?.[0]?.symbol === contract ||
+            o.descriptionToShare?.includes(contract)),
+      );
+      if (match || Date.now() > deadline) return match;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+  };
 
   const root = env.FUT_ROOT ?? "/MES";
   const series = await client.futureSeries(root);
@@ -230,6 +265,21 @@ async function main() {
         2,
       ),
     );
+    const placed = await awaitPlacedOrder(result.contract.symbol);
+    if (placed) {
+      console.log("PLACED:", {
+        orderId: placed.orderId,
+        status: placed.status,
+        order: placed.descriptionToShare,
+      });
+      console.log(
+        `cancel it with: TOS_CANCEL=${placed.orderId} node --env-file=.env dist/example/futuresPaperOrder.js`,
+      );
+    } else {
+      console.log(
+        "submitted, but no matching order_events entry within 10s — check the web UI",
+      );
+    }
   } else {
     console.log("dry run — re-run with --submit to send to PaperMoney");
   }

@@ -52,6 +52,26 @@ function tradingSystemOf(url: string): TradingSystem {
   return /papermoney/i.test(url) ? "PaperMoney" : "LiveTrading";
 }
 
+/** SPA stores `PaperMoney` / `LiveTrading`; some keys use `traderx::papermoney`. */
+export function parseTradingSystem(
+  value?: string | null,
+): TradingSystem | undefined {
+  if (!value) return undefined;
+  const v = value.toLowerCase();
+  if (v.includes("paper")) return "PaperMoney";
+  if (v.includes("live")) return "LiveTrading";
+  return undefined;
+}
+
+function shortUrl(url: string): string {
+  try {
+    const u = new URL(url);
+    return u.origin + u.pathname;
+  } catch {
+    return url || "(empty)";
+  }
+}
+
 function parsePayload(data: string): Frame[] {
   try {
     const msg = JSON.parse(data);
@@ -92,8 +112,11 @@ export async function captureBrowserSession({
   // Track every socket the SPA opens; the SPA re-logs-in on a new socket when
   // you switch between live and paperMoney.
   const sessionsBySocket = new Map<string, Partial<BrowserSession>>();
+  const attached = new WeakSet<Page>();
 
   const attach = async (page: Page) => {
+    if (attached.has(page)) return;
+    attached.add(page);
     const cdp: CDPSession = await page.createCDPSession();
     await cdp.send("Network.enable");
     cdp.on("Network.webSocketCreated", ({ requestId, url }) => {
@@ -122,11 +145,21 @@ export async function captureBrowserSession({
     });
   };
 
+  const attachAll = async () => {
+    for (const t of browser.targets()) {
+      const p = await t.page().catch(() => null);
+      if (p) await attach(p).catch(() => undefined);
+    }
+    for (const p of await browser.pages()) {
+      await attach(p).catch(() => undefined);
+    }
+  };
+
   const page = (await browser.pages())[0] ?? (await browser.newPage());
   await attach(page);
-  browser.on("targetcreated", async (t) => {
-    const p = await t.page();
-    if (p) await attach(p).catch(() => undefined);
+  await attachAll();
+  browser.on("targetcreated", async () => {
+    await attachAll();
   });
 
   log(`Opening ${TOS_WEB_ORIGIN} — log in as usual.`);
@@ -139,12 +172,37 @@ export async function captureBrowserSession({
 
   // Primary source: the SPA persists its session in sessionStorage
   // (`token`, `tradingSystem`) right after a successful login/schwab or login.
-  const readStorage = async (): Promise<
-    { token?: string; tradingSystem?: string; url: string } | undefined
-  > => {
+  const tosPages = async (): Promise<Page[]> => {
+    await attachAll();
+    const seen = new Set<Page>();
+    const out: Page[] = [];
+    for (const t of browser.targets()) {
+      const p = await t.page().catch(() => null);
+      if (p && !seen.has(p)) {
+        seen.add(p);
+        out.push(p);
+      }
+    }
     for (const p of await browser.pages()) {
+      if (!seen.has(p)) out.push(p);
+    }
+    return out;
+  };
+
+  const readStorage = async (): Promise<
+    | {
+        token?: string;
+        tradingSystem?: string;
+        url: string;
+      }
+    | undefined
+  > => {
+    for (const p of await tosPages()) {
       try {
-        if (!p.url().startsWith(TOS_WEB_ORIGIN)) continue;
+        const href = p.url();
+        if (!href.includes("thinkorswim.com") && !href.includes("schwab.com")) {
+          continue;
+        }
         const r = await p.evaluate(() => ({
           token: sessionStorage.getItem("token") ?? undefined,
           tradingSystem: sessionStorage.getItem("tradingSystem") ?? undefined,
@@ -173,7 +231,7 @@ export async function captureBrowserSession({
     );
     // 2) sessionStorage session (token + trading system)
     const stored = await readStorage();
-    const storedSystem = stored?.tradingSystem as TradingSystem | undefined;
+    const storedSystem = parseTradingSystem(stored?.tradingSystem);
 
     let result: BrowserSession | undefined;
     if (sniffed) {
@@ -199,13 +257,17 @@ export async function captureBrowserSession({
 
     if (stored?.token) {
       status(
-        `Logged in (${storedSystem ?? "unknown system"}); waiting for the UI to be in ${tradingSystem}… ` +
-          `(switch via the account menu)`,
+        `Logged in (${storedSystem ?? stored.tradingSystem ?? "unknown system"}); waiting for the UI to be in ${tradingSystem}… ` +
+          `(switch via the account menu in this script's Chrome window)`,
       );
     } else {
-      const pages = await browser.pages();
+      const pages = await tosPages();
+      const urls = pages.map((p) => shortUrl(p.url())).join(" | ");
+      const socks = [...sessionsBySocket.values()]
+        .map((s) => s.tradingSystem)
+        .join(",");
       status(
-        `Waiting for login… (${pages.map((p) => new URL(p.url()).origin + new URL(p.url()).pathname).join(" | ")})`,
+        `Waiting for login… pages=${pages.length} [${urls}] sockets=[${socks}]`,
       );
     }
     if (Date.now() > deadline) {
