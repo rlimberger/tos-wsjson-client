@@ -64,6 +64,43 @@ export async function startOrderFeedServer(port = 8787) {
     }
   };
 
+  let account: string | undefined;
+
+  const sendSnapshot = (ws: WsSocket) => {
+    ws.send(
+      JSON.stringify({
+        type: "session",
+        account: account ?? null,
+        tradingSystem: session.tradingSystem,
+      }),
+    );
+    ws.send(
+      JSON.stringify({ type: "orders", orders: latestOrders, at: Date.now() }),
+    );
+    ws.send(
+      JSON.stringify({ type: "fills", fills: latestFills, at: Date.now() }),
+    );
+    ws.send(
+      JSON.stringify({
+        type: "positions",
+        positions: latestPositions,
+        at: Date.now(),
+      }),
+    );
+    ws.send(JSON.stringify({ type: "connection", state: connectionState }));
+  };
+
+  // Registered before the gateway login, not after: the port is listening from
+  // the moment the server is constructed, and a watcher reconnecting during the
+  // login window would otherwise be accepted and then never hear anything.
+  wss.on("connection", (ws) => {
+    clients.add(ws);
+    sendSnapshot(ws);
+    ws.on("close", () => clients.delete(ws));
+  });
+
+  console.log(`[feed] serving ws://127.0.0.1:${port} — connecting…`);
+
   const client = await RealWsJsonClient.create({
     tradingSystem: session.tradingSystem,
     gatewayUrl: session.gatewayUrl,
@@ -84,42 +121,17 @@ export async function startOrderFeedServer(port = 8787) {
     accessToken: session.accessToken,
     refreshToken: session.refreshToken ?? "n/a",
   });
-  const account =
+  account =
     session.accountCode ??
     (await client.resolveAccountCode()) ??
     (() => {
       throw new Error("could not resolve an account code");
     })();
-
-  wss.on("connection", (ws) => {
-    clients.add(ws);
-    ws.send(
-      JSON.stringify({
-        type: "session",
-        account,
-        tradingSystem: session.tradingSystem,
-      }),
-    );
-    ws.send(
-      JSON.stringify({
-        type: "orders",
-        orders: latestOrders,
-        at: Date.now(),
-      }),
-    );
-    ws.send(
-      JSON.stringify({ type: "fills", fills: latestFills, at: Date.now() }),
-    );
-    ws.send(
-      JSON.stringify({
-        type: "positions",
-        positions: latestPositions,
-        at: Date.now(),
-      }),
-    );
-    ws.send(JSON.stringify({ type: "connection", state: connectionState }));
-    ws.on("close", () => clients.delete(ws));
-  });
+  console.log(
+    `[feed] ${session.tradingSystem} account ${account} — ready on ws://127.0.0.1:${port}`,
+  );
+  // Clients that connected during login still have `account: null`.
+  for (const ws of clients) sendSnapshot(ws);
 
   console.log(
     `[feed] serving ws://127.0.0.1:${port} — ${session.tradingSystem} account ${account}`,
