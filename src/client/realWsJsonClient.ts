@@ -140,16 +140,21 @@ export class RealWsJsonClient implements WsJsonClient {
     refreshToken?: string;
   } = {};
 
+  private readonly responseParser: ResponseParser;
+
   constructor(
     private readonly socket = newGatewaySocket(
       FALLBACK_GATEWAY_URLS.papermoney,
     ),
-    private readonly responseParser = new ResponseParser(this.genericHandler),
+    responseParser?: ResponseParser,
     private readonly clientConfig: {
       tradingSystem?: TradingSystem;
       allowLiveTrading?: boolean;
     } = {},
-  ) {}
+  ) {
+    this.responseParser =
+      responseParser ?? new ResponseParser(this.genericHandler);
+  }
 
   /**
    * Creates a client connected to the gateway for the given trading system.

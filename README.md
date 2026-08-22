@@ -73,6 +73,41 @@ There seems to be currently two ways to authenticate:
 
    2.3 The token is valid for 24 hours.
 
+# PaperMoney futures order builder
+
+This fork adds a futures order builder that talks to the thinkorswim **PaperMoney** `wsjson` gateway. Futures use the same `place_order` `INIT_STOCK` / `EDIT_ORDER` pair as stocks: there is no `INIT_FUTURE`. The missing piece is `future_series`, which turns a root such as `/MES` into the tradeable contract (e.g. `/MESU26`).
+
+Live routing is gated off. `RealWsJsonClient.create()` defaults to PaperMoney and throws if you pass `tradingSystem: "LiveTrading"` without `{ allowLiveTrading: true }`.
+
+CONFIRM is a draft/validation call. SUBMIT is the state-changing call. The builder will not SUBMIT unless you have a `ConfirmedFuturesDraft` from a successful CONFIRM, and the example CLI is confirm-only unless you pass `--submit`.
+
+```
+yarn build
+# first run: Chrome opens, you log in, tokens are saved to .env
+node --env-file=.env dist/example/futuresPaperOrder.js --login
+# confirm only (default)
+node --env-file=.env dist/example/futuresPaperOrder.js
+# actually submit on paper (LIMIT far from the market is safest)
+FUT_ROOT=/MES FUT_LIMIT=1 node --env-file=.env dist/example/futuresPaperOrder.js --submit
+```
+
+`--login` opens a real Chrome window. Complete Schwab login and MFA yourself; the script only watches the SPA's WebSocket and writes `TOS_GATEWAY_URL` / `TOS_ACCESS_TOKEN` / `TOS_ACCOUNT_CODE` to `.env`. It does not type credentials.
+
+```typescript
+const client = await RealWsJsonClient.create({ tradingSystem: "PaperMoney" });
+await client.authenticateWithAccessToken({ accessToken, refreshToken });
+const { defaultAccountCode } = (await client.userProperties()).body;
+const draft = await client.futuresOrderBuilder().confirm("/MES", {
+  accountNumber: defaultAccountCode as string,
+  side: "BUY",
+  quantity: 1,
+  orderType: "LIMIT",
+  limitPrice: 1,
+});
+// inspect draft.confirmation, then:
+// await client.futuresOrderBuilder().submit(draft);
+```
+
 # Supported APIs
 
 - ✅ Authentication via access token
@@ -90,7 +125,8 @@ There seems to be currently two ways to authenticate:
 - ✅ Option chain details
 - ✅ Option chain quotes
 - ✅ Option quotes
-- ✅ Order events
+- ✅ Order events (full WORKING/QUEUED/FILLED/CANCELED/FINAL/EXECUTION subscription)
+- ✅ `future_series` + PaperMoney futures CONFIRM/SUBMIT builder
 - ✅ Market depth
 - ✅ Get watchlist
 

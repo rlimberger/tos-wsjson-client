@@ -17,7 +17,11 @@ import type { Browser, CDPSession, Page } from "puppeteer";
 import puppeteer from "puppeteer-extra";
 import type { PuppeteerExtra } from "puppeteer-extra";
 import StealthPlugin from "puppeteer-extra-plugin-stealth";
-import { TOS_WEB_ORIGIN, TradingSystem } from "../client/tosWebConfig.js";
+import {
+  gatewayUrlFor,
+  TOS_WEB_ORIGIN,
+  TradingSystem,
+} from "../client/tosWebConfig.js";
 
 export type BrowserSession = {
   tradingSystem: TradingSystem;
@@ -80,7 +84,6 @@ export async function captureBrowserSession({
   // Track every socket the SPA opens; the SPA re-logs-in on a new socket when
   // you switch between live and paperMoney.
   const sessionsBySocket = new Map<string, Partial<BrowserSession>>();
-  let latestSocket: string | undefined;
 
   const attach = async (page: Page) => {
     const cdp: CDPSession = await page.createCDPSession();
@@ -91,7 +94,6 @@ export async function captureBrowserSession({
         gatewayUrl: url,
         tradingSystem: tradingSystemOf(url),
       });
-      latestSocket = requestId;
       log(`↔ SPA opened gateway socket: ${url} (${tradingSystemOf(url)})`);
     });
     cdp.on("Network.webSocketFrameReceived", ({ requestId, response }) => {
@@ -127,40 +129,80 @@ export async function captureBrowserSession({
   }
   await page.goto(`${TOS_WEB_ORIGIN}/`, { waitUntil: "domcontentloaded" });
 
+  // Primary source: the SPA persists its session in sessionStorage
+  // (`token`, `tradingSystem`) right after a successful login/schwab or login.
+  const readStorage = async (): Promise<
+    { token?: string; tradingSystem?: string; url: string } | undefined
+  > => {
+    for (const p of await browser.pages()) {
+      try {
+        if (!p.url().startsWith(TOS_WEB_ORIGIN)) continue;
+        const r = await p.evaluate(() => ({
+          token: sessionStorage.getItem("token") ?? undefined,
+          tradingSystem: sessionStorage.getItem("tradingSystem") ?? undefined,
+          url: location.href,
+        }));
+        if (r.token) return r;
+      } catch {
+        /* page navigating */
+      }
+    }
+    return undefined;
+  };
+
   const deadline = Date.now() + timeoutMs;
-  let hinted = false;
+  let lastStatus = "";
+  const status = (m: string) => {
+    if (m !== lastStatus) {
+      lastStatus = m;
+      log(m);
+    }
+  };
   for (;;) {
-    const ready = [...sessionsBySocket.values()].find(
-      (s) =>
-        s.tradingSystem === tradingSystem && s.accessToken && s.accountCode,
+    // 1) sniffed socket session (has everything)
+    const sniffed = [...sessionsBySocket.values()].find(
+      (s) => s.tradingSystem === tradingSystem && s.accessToken,
     );
-    if (ready) {
+    // 2) sessionStorage session (token + trading system)
+    const stored = await readStorage();
+    const storedSystem = stored?.tradingSystem as TradingSystem | undefined;
+
+    let result: BrowserSession | undefined;
+    if (sniffed) {
+      result = sniffed as BrowserSession;
+    } else if (stored?.token && storedSystem === tradingSystem) {
+      result = {
+        tradingSystem,
+        gatewayUrl: await gatewayUrlFor(tradingSystem),
+        accessToken: stored.token,
+      };
+    }
+    if (result) {
+      log(
+        `✓ ${tradingSystem} session captured via ${sniffed ? "websocket" : "sessionStorage"}` +
+          (result.accountCode ? ` (account ${result.accountCode})` : ""),
+      );
       if (!keepBrowser) {
-        log(
-          "Captured everything; closing the browser so this token has a single consumer.",
-        );
+        log("Closing the browser so this token has a single consumer.");
         await browser.close();
       }
-      return ready as BrowserSession;
+      return result;
     }
-    const latest = latestSocket
-      ? sessionsBySocket.get(latestSocket)
-      : undefined;
-    if (
-      !hinted &&
-      latest?.accessToken &&
-      latest.tradingSystem !== tradingSystem
-    ) {
-      hinted = true;
-      log(
-        `Logged into ${latest.tradingSystem}; waiting for you to switch the UI to ${tradingSystem}…`,
+
+    if (stored?.token) {
+      status(
+        `Logged in (${storedSystem ?? "unknown system"}); waiting for the UI to be in ${tradingSystem}… ` +
+          `(switch via the account menu)`,
       );
+    } else {
+      const pages = await browser.pages();
+      status(`Waiting for login… (${pages.map((p) => p.url()).join(" | ")})`);
     }
     if (Date.now() > deadline) {
       if (!keepBrowser) await browser.close();
       throw new Error(`timed out waiting for a ${tradingSystem} session`);
     }
-    await new Promise((r) => setTimeout(r, 1000));
+    await new Promise((r) => setTimeout(r, 1500));
   }
 }
 

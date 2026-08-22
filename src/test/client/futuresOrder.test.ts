@@ -12,8 +12,9 @@ import {
   LiveTradingDisabledError,
   resolveGatewayUrl,
 } from "../../client/tosWebConfig";
-import { ORDER_EVENT_TYPES } from "../../client/services/orderEventsMessageHandler";
-import OrderEventsMessageHandler from "../../client/services/orderEventsMessageHandler";
+import OrderEventsMessageHandler, {
+  ORDER_EVENT_TYPES,
+} from "../../client/services/orderEventsMessageHandler";
 import GenericIncomingMessageHandler from "../../client/services/genericIncomingMessageHandler";
 
 const account = "12345678";
@@ -186,7 +187,11 @@ describe("futures order builders", () => {
   });
 
   it("omits limitPrice on MARKET CONFIRM and SUBMIT", () => {
-    const market = { ...mesLimit, orderType: "MARKET" as const, limitPrice: undefined };
+    const market = {
+      ...mesLimit,
+      orderType: "MARKET" as const,
+      limitPrice: undefined,
+    };
     const confirm = new ConfirmOrderMessageHandler().buildRequest({
       spec: market,
     }).payload[0].params.orders[0];
@@ -227,16 +232,12 @@ describe("futures order builders", () => {
     expect(() => assertTradingSystemAllowed("LiveTrading")).toThrow(
       LiveTradingDisabledError,
     );
-    expect(() =>
-      assertTradingSystemAllowed("LiveTrading", true),
-    ).not.toThrow();
+    expect(() => assertTradingSystemAllowed("LiveTrading", true)).not.toThrow();
     expect(() => assertTradingSystemAllowed("PaperMoney")).not.toThrow();
   });
 
   it("subscribes to the six-type order_events feed", () => {
-    expect(
-      new OrderEventsMessageHandler().buildRequest("12345678"),
-    ).toEqual({
+    expect(new OrderEventsMessageHandler().buildRequest("12345678")).toEqual({
       payload: [
         {
           header: { service: "order_events", id: "order_events", ver: 0 },

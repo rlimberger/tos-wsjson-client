@@ -16,7 +16,9 @@
     "check_prettier": "prettier --check .",
     "lint": "eslint .",
     "test": "jest",
-    "ci": "yarn check_prettier && yarn build && yarn lint && yarn test"
+    "ci": "yarn check_prettier && yarn build && yarn lint && yarn test",
+    "paper-futures": "node --env-file=.env dist/example/futuresPaperOrder.js",
+    "paper-login": "node dist/example/browserSession.js PaperMoney"
   },
   "dependencies": {
     "debug": "^4.3.4",

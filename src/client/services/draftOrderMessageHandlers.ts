@@ -116,9 +116,7 @@ export class SubmitDraftOrderMessageHandler implements WebSocketApiMessageHandle
         accountCode: spec.accountNumber,
         action: "SUBMIT",
         marker: spec.marker ?? "SINGLE",
-        orders: [
-          wireOrder(spec, "EDIT_ORDER", { refOrderId, tag: "TOSWeb" }),
-        ],
+        orders: [wireOrder(spec, "EDIT_ORDER", { refOrderId, tag: "TOSWeb" })],
       },
     });
   }

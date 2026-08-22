@@ -91,9 +91,5 @@ export default class OrderEventsMessageHandler implements WebSocketApiMessageHan
     });
   }
 
-  requestId(_accountNumber: string): string {
-    return "order_events";
-  }
-
   service: ApiService = "order_events";
 }
