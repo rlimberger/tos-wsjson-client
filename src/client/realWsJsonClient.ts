@@ -140,6 +140,7 @@ export class RealWsJsonClient implements WsJsonClient {
   private buffer = new BufferedIterator<ParsedPayloadResponse>();
   private iterator = new MulticastIterator(this.buffer);
   private state = ChannelState.DISCONNECTED;
+  private bufferEnded = false;
   private credentials: {
     authCode?: string;
     accessToken?: string;
@@ -230,6 +231,7 @@ export class RealWsJsonClient implements WsJsonClient {
       case ChannelState.DISCONNECTED:
         this.buffer = new BufferedIterator<ParsedPayloadResponse>();
         this.iterator = new MulticastIterator(this.buffer);
+        this.bufferEnded = false;
         this.state = ChannelState.CONNECTING;
         return await this.doConnect();
       case ChannelState.CONNECTING: // no-op
@@ -270,7 +272,8 @@ export class RealWsJsonClient implements WsJsonClient {
       this.handleSchwabLoginResponse(message, resolve, reject);
     } else {
       const parsedResponse = responseParser.parseResponse(message);
-      if (parsedResponse) {
+      if (parsedResponse && !this.bufferEnded) {
+        // frames can still arrive after disconnect(); dropping them is correct
         parsedResponse.forEach((r) => buffer.emit(r));
       }
     }
@@ -569,6 +572,8 @@ export class RealWsJsonClient implements WsJsonClient {
   }
 
   disconnect() {
+    if (this.bufferEnded) return;
+    this.bufferEnded = true;
     this.socket?.close();
     this.state = ChannelState.DISCONNECTED;
     // This ensures that listeners will resolve the promise cleanly from any `for await` loops
