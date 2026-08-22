@@ -63,12 +63,29 @@ export type OrderSpec = {
   limitPrice?: number;
   /** Trigger price for STOP / STOPLIMIT. */
   stopPrice?: number;
-  tif?: Tif;
+  tif?: Tif | string;
   marker?: Marker;
+  /** Existing order id; omit for a new order so JSON drops the field. */
+  refOrderId?: number;
   /** Key used in the `update-draft-order-<key>` request id. The SPA uses the
    *  root symbol for futures; defaults to the first leg's symbol. */
   draftKey?: string;
 };
+
+/**
+ * A futures *root* (`/MES`) is not a tradable wire symbol. A *contract*
+ * (`/MESU26`) ends in a 1–2 digit year after the month code.
+ */
+export function isFuturesRoot(symbol: string): boolean {
+  if (!symbol.startsWith("/")) return false;
+  const core = symbol.split(":")[0];
+  return !/\d{1,2}$/.test(core);
+}
+
+export function normalizeFuturesRoot(root: string): string {
+  const trimmed = root.trim().toUpperCase();
+  return trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
+}
 
 /** Wire-format leg: quantity is signed (BUY > 0, SELL < 0). */
 export function wireLeg({ symbol, quantity, side }: OrderLeg) {
@@ -77,28 +94,46 @@ export function wireLeg({ symbol, quantity, side }: OrderLeg) {
 }
 
 export function draftOrderId(spec: OrderSpec): string {
-  return `update-draft-order-${spec.draftKey ?? spec.legs[0].symbol}`;
+  const key = spec.draftKey ?? spec.legs[0]?.symbol;
+  if (!key) throw new Error("draftKey or a first leg symbol is required");
+  return `update-draft-order-${key}`;
 }
+
+export type WireOrderExtra = {
+  refOrderId?: number;
+  tag?: string;
+  /** CONFIRM omits tif; SUBMIT always includes it (DAY if unspecified). */
+  includeTif?: boolean;
+};
 
 /**
  * Builds the per-order object shared by CONFIRM and SUBMIT, mirroring the SPA
- * serializers (`limitPrice` omitted for STOP; `stopPrice` only for STOP/STOPLIMIT).
+ * serializers (`limitPrice` omitted for STOP/TRAILSTOP and for MARKET).
  */
 export function wireOrder(
   spec: OrderSpec,
   requestType: RequestType,
-  refOrderId?: number,
+  extra: WireOrderExtra = {},
 ) {
-  const { orderType, limitPrice, stopPrice, tif } = spec;
+  const { orderType, limitPrice, stopPrice } = spec;
+  const refOrderId = extra.refOrderId ?? spec.refOrderId;
+  const includeTif = extra.includeTif ?? requestType === "EDIT_ORDER";
+  const tif = spec.tif ?? (includeTif ? "DAY" : undefined);
   const isStop = orderType === "STOP" || orderType === "STOPLIMIT";
+  const omitLimit =
+    limitPrice === undefined ||
+    orderType === "STOP" ||
+    orderType === "TRAILSTOP" ||
+    orderType === "MARKET";
   return {
     requestType,
     ...(refOrderId !== undefined ? { refOrderId } : {}),
-    ...(tif ? { tif } : {}),
+    ...(includeTif && tif ? { tif } : {}),
     orderType,
-    ...(limitPrice !== undefined && orderType !== "STOP" ? { limitPrice } : {}),
+    ...(!omitLimit ? { limitPrice } : {}),
     ...(isStop && stopPrice !== undefined ? { stopPrice } : {}),
     legs: spec.legs.map(wireLeg),
+    ...(extra.tag ? { tag: extra.tag } : {}),
   };
 }
 
@@ -107,20 +142,21 @@ export function validateOrderSpec(spec: OrderSpec): void {
   if (!spec.legs?.length) throw new Error("at least one leg is required");
   for (const leg of spec.legs) {
     if (!leg.symbol) throw new Error("leg.symbol is required");
-    if (!(leg.quantity > 0)) throw new Error("leg.quantity must be > 0");
-    if (
-      /^\/[A-Z0-9]+(:[A-Z]+)?$/.test(leg.symbol) &&
-      !/\d{1,2}$/.test(leg.symbol.split(":")[0])
-    ) {
+    if (!(leg.quantity > 0) || !Number.isFinite(leg.quantity)) {
+      throw new Error("leg.quantity must be a finite number > 0");
+    }
+    if (isFuturesRoot(leg.symbol)) {
       throw new Error(
         `"${leg.symbol}" looks like a futures ROOT; pass the contract symbol from future_series (e.g. /MESU26)`,
       );
     }
   }
   const needsLimit = ["LIMIT", "STOPLIMIT", "LOC"].includes(spec.orderType);
-  if (needsLimit && spec.limitPrice === undefined)
+  if (needsLimit && spec.limitPrice === undefined) {
     throw new Error(`${spec.orderType} requires limitPrice`);
+  }
   const needsStop = ["STOP", "STOPLIMIT"].includes(spec.orderType);
-  if (needsStop && spec.stopPrice === undefined)
+  if (needsStop && spec.stopPrice === undefined) {
     throw new Error(`${spec.orderType} requires stopPrice`);
+  }
 }

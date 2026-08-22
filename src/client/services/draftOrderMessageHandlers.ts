@@ -91,7 +91,7 @@ export class ConfirmOrderMessageHandler implements WebSocketApiMessageHandler<Co
         accountCode: spec.accountNumber,
         action: "CONFIRM",
         marker: spec.marker ?? "SINGLE",
-        orders: [wireOrder(spec, requestType, refOrderId)],
+        orders: [wireOrder(spec, requestType, { refOrderId })],
       },
     });
   }
@@ -110,17 +110,15 @@ export class SubmitDraftOrderMessageHandler implements WebSocketApiMessageHandle
     ver = 0,
   }: SubmitOrderRequest): RawPayloadRequest {
     validateOrderSpec(spec);
-    const order = {
-      ...wireOrder({ tif: "DAY", ...spec }, "EDIT_ORDER", refOrderId),
-      tag: "TOSWeb",
-    };
     return newPayload({
       header: { id: draftOrderId(spec), service: "place_order", ver },
       params: {
         accountCode: spec.accountNumber,
         action: "SUBMIT",
         marker: spec.marker ?? "SINGLE",
-        orders: [order],
+        orders: [
+          wireOrder(spec, "EDIT_ORDER", { refOrderId, tag: "TOSWeb" }),
+        ],
       },
     });
   }
@@ -132,5 +130,12 @@ export function draftProblems(body: RawDraftOrderResponse): string[] {
   if (body.error) problems.push(body.error);
   if (body.validationError) problems.push(body.validationError);
   for (const o of body.orders ?? []) if (o.error) problems.push(o.error);
+  if (!body.orders?.length && problems.length === 0) {
+    problems.push("CONFIRM returned no orders");
+  }
   return problems;
+}
+
+export function draftWarnings(body: RawDraftOrderResponse): string[] {
+  return (body.confirmation?.warnings ?? []).map((w) => w.message);
 }

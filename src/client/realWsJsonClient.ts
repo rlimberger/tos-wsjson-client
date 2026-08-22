@@ -172,11 +172,15 @@ export class RealWsJsonClient implements WsJsonClient {
   static async create({
     tradingSystem = "PaperMoney",
     useInstanceB = false,
+    gatewayUrl,
   }: {
     tradingSystem?: TradingSystem;
     useInstanceB?: boolean;
+    /** Explicit gateway URL (e.g. the one captured from the browser session). */
+    gatewayUrl?: string;
   } = {}): Promise<RealWsJsonClient> {
-    const url = await gatewayUrlFor(tradingSystem, { useInstanceB });
+    const url =
+      gatewayUrl ?? (await gatewayUrlFor(tradingSystem, { useInstanceB }));
     logger("connecting to %s gateway %s", tradingSystem, url);
     return new RealWsJsonClient(newGatewaySocket(url));
   }

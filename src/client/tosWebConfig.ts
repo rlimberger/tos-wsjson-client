@@ -41,6 +41,24 @@ export async function fetchTosWebConfig(
   return (await res.json()) as TosWebConfig;
 }
 
+export class LiveTradingDisabledError extends Error {
+  constructor() {
+    super(
+      "LiveTrading is disabled. Pass { allowLiveTrading: true } to enable live routing.",
+    );
+    this.name = "LiveTradingDisabledError";
+  }
+}
+
+export function assertTradingSystemAllowed(
+  tradingSystem: TradingSystem,
+  allowLiveTrading?: boolean,
+): void {
+  if (tradingSystem === "LiveTrading" && allowLiveTrading !== true) {
+    throw new LiveTradingDisabledError();
+  }
+}
+
 export function resolveGatewayUrl(
   tradingSystem: TradingSystem,
   urls: TosWebConfig["serviceGatewayUrlsSchwab"] = FALLBACK_GATEWAY_URLS,

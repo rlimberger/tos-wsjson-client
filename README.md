@@ -153,11 +153,16 @@ Example (paper money, confirm only; add `--submit` to send):
 
 ```
 yarn build
-node --env-file=.env dist/example/futuresPaperOrder.js
+node --env-file=.env dist/example/futuresPaperOrder.js            # opens Chrome on first run
 FUT_ROOT=/MES FUT_SIDE=BUY FUT_QTY=1 FUT_TYPE=LIMIT FUT_LIMIT=1000 \
   node --env-file=.env dist/example/futuresPaperOrder.js --submit
 ```
 
-Unverified against a live session yet: whether a token from the live gateway
-is accepted by the paper gateway (the web UI fetches a fresh authCode when
-switching), and the exact contract-symbol string returned by `future_series`.
+Login is interactive: `src/example/browserSession.ts` opens a headful Chrome
+(persistent profile in `./puppeteer-data`), you sign in normally, and it
+captures — from the SPA's own WebSocket via DevTools — the gateway URL, the
+`login/schwab`/`login` token + refresh token and your default account code,
+then saves them to `.env`. For PaperMoney, switch the web UI to paperMoney; the
+SPA reconnects to the paper gateway and the script picks up that session
+instead. Use `--login` to force a new capture. `node dist/example/browserSession.js`
+runs the capture alone.

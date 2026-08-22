@@ -1,54 +1,78 @@
 /**
  * Futures order scaffold against the thinkorswim PaperMoney gateway.
  *
+ *   yarn build
  *   node --env-file=.env dist/example/futuresPaperOrder.js            # CONFIRM only (dry run)
  *   node --env-file=.env dist/example/futuresPaperOrder.js --submit   # actually SUBMIT (paper)
+ *   node --env-file=.env dist/example/futuresPaperOrder.js --login    # force a fresh browser login
  *
- * Env: TOS_ACCESS_TOKEN + TOS_REFRESH_TOKEN (from a prior login/schwab), or
- *      TOS_AUTH_CODE (single-use code from the trade.thinkorswim.com oauth redirect).
- * Optional: TOS_TRADING_SYSTEM=PaperMoney|LiveTrading (default PaperMoney),
- *           FUT_ROOT=/MES FUT_SIDE=BUY FUT_QTY=1 FUT_TYPE=LIMIT|MARKET FUT_LIMIT=<price>
+ * On first run (or --login) a Chrome window opens: log in normally; the script
+ * captures the gateway URL, token and account from the SPA's own traffic and
+ * saves them to .env (TOS_GATEWAY_URL, TOS_ACCESS_TOKEN, TOS_REFRESH_TOKEN,
+ * TOS_ACCOUNT_CODE, TOS_TRADING_SYSTEM). Later runs reuse .env until the token
+ * expires (~24h), then fall back to the browser again.
  *
- * NOTE: the paper gateway may require a token issued against it (the SPA
- * re-runs the LMS authCode flow when switching trading systems). If login
- * fails with a token from live, obtain a fresh authCode while the web UI is in
- * paperMoney mode and use TOS_AUTH_CODE.
+ * Order knobs: FUT_ROOT=/MES FUT_SIDE=BUY FUT_QTY=1 FUT_TYPE=LIMIT|MARKET|STOP|STOPLIMIT
+ *              FUT_LIMIT=<price> FUT_STOP=<price> FUT_TIF=DAY|GTC
  */
 import { RealWsJsonClient } from "../client/realWsJsonClient.js";
 import { OrderType, Tif } from "../client/services/orderTypes.js";
 import { TradingSystem } from "../client/tosWebConfig.js";
+import {
+  BrowserSession,
+  captureBrowserSession,
+  saveSessionToDotEnv,
+  sessionFromEnv,
+} from "./browserSession.js";
 
 const env = process.env;
-const submit = process.argv.includes("--submit");
-const tradingSystem = (env.TOS_TRADING_SYSTEM as TradingSystem) ?? "PaperMoney";
+const argv = process.argv.slice(2);
+const submit = argv.includes("--submit");
+const forceLogin = argv.includes("--login");
+const wanted = (env.TOS_TRADING_SYSTEM as TradingSystem) ?? "PaperMoney";
+
+async function connect(session: BrowserSession): Promise<RealWsJsonClient> {
+  const client = await RealWsJsonClient.create({
+    tradingSystem: session.tradingSystem,
+    gatewayUrl: session.gatewayUrl,
+  });
+  await client.authenticateWithAccessToken({
+    accessToken: session.accessToken,
+    refreshToken: session.refreshToken ?? "n/a",
+  });
+  return client;
+}
+
+async function getClient(): Promise<{
+  client: RealWsJsonClient;
+  session: BrowserSession;
+}> {
+  const cached = forceLogin ? undefined : sessionFromEnv();
+  if (cached && cached.tradingSystem === wanted) {
+    try {
+      return { client: await connect(cached), session: cached };
+    } catch (e) {
+      console.warn(`cached session rejected (${String(e)}); opening browser`);
+    }
+  }
+  const session = await captureBrowserSession({ tradingSystem: wanted });
+  saveSessionToDotEnv(session);
+  return { client: await connect(session), session };
+}
 
 async function main() {
-  if (tradingSystem === "LiveTrading" && submit) {
+  if (wanted === "LiveTrading" && submit) {
     throw new Error(
       "refusing to --submit against LiveTrading from the scaffold",
     );
   }
-  const client = await RealWsJsonClient.create({ tradingSystem });
-  if (env.TOS_ACCESS_TOKEN && env.TOS_REFRESH_TOKEN) {
-    await client.authenticateWithAccessToken({
-      accessToken: env.TOS_ACCESS_TOKEN,
-      refreshToken: env.TOS_REFRESH_TOKEN,
-    });
-  } else if (env.TOS_AUTH_CODE) {
-    await client.authenticateWithAuthCode(env.TOS_AUTH_CODE);
-    console.log(
-      "token:",
-      client.accessToken,
-      "\nrefreshToken:",
-      client.refreshToken,
-    );
-  } else {
-    throw new Error("set TOS_ACCESS_TOKEN+TOS_REFRESH_TOKEN or TOS_AUTH_CODE");
-  }
-
-  const props = await client.userProperties();
-  const accountNumber = String(props.body.defaultAccountCode);
-  console.log("account:", accountNumber, "tradingSystem:", tradingSystem);
+  const { client, session } = await getClient();
+  const accountNumber =
+    session.accountCode ??
+    String((await client.userProperties()).body.defaultAccountCode);
+  console.log(
+    `connected: ${session.tradingSystem} ${session.gatewayUrl} account ${accountNumber}`,
+  );
 
   const root = env.FUT_ROOT ?? "/MES";
   const series = await client.futureSeries(root);
@@ -63,6 +87,7 @@ async function main() {
 
   const orderType = (env.FUT_TYPE as OrderType) ?? "LIMIT";
   const limitPrice = env.FUT_LIMIT ? Number(env.FUT_LIMIT) : undefined;
+  const stopPrice = env.FUT_STOP ? Number(env.FUT_STOP) : undefined;
   if (orderType === "LIMIT" && limitPrice === undefined) {
     throw new Error(
       "FUT_LIMIT is required for LIMIT orders (pick a price far from the market for a safe paper test)",
@@ -77,6 +102,7 @@ async function main() {
       quantity: Number(env.FUT_QTY ?? 1),
       orderType,
       limitPrice,
+      stopPrice,
       tif: env.FUT_TIF as Tif | undefined,
     },
     { dryRun: !submit },

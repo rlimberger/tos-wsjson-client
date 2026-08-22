@@ -1,6 +1,17 @@
 import { RawPayloadRequest } from "../tdaWsJsonTypes.js";
 import { ApiService } from "./apiService.js";
-import WebSocketApiMessageHandler from "./webSocketApiMessageHandler.js";
+import WebSocketApiMessageHandler, {
+  newPayload,
+} from "./webSocketApiMessageHandler.js";
+
+export const ORDER_EVENT_TYPES = [
+  "WORKING",
+  "QUEUED",
+  "FILLED",
+  "CANCELED",
+  "FINAL",
+  "EXECUTION",
+] as const;
 
 export type OrderEvent = {
   id: number;
@@ -69,9 +80,19 @@ export type OrderEventsSnapshotResponse = {
   service: "order_events";
 };
 
-export default class OrderEventsMessageHandler implements WebSocketApiMessageHandler<never> {
-  buildRequest(_: never): RawPayloadRequest {
-    throw new Error("Should never be called, this message is inbound only");
+export default class OrderEventsMessageHandler implements WebSocketApiMessageHandler<string> {
+  buildRequest(accountNumber: string): RawPayloadRequest {
+    return newPayload({
+      header: { service: "order_events", id: "order_events", ver: 0 },
+      params: {
+        account: accountNumber,
+        types: [...ORDER_EVENT_TYPES],
+      },
+    });
+  }
+
+  requestId(_accountNumber: string): string {
+    return "order_events";
   }
 
   service: ApiService = "order_events";
