@@ -204,7 +204,9 @@ export async function captureBrowserSession({
       );
     } else {
       const pages = await browser.pages();
-      status(`Waiting for login… (${pages.map((p) => p.url()).join(" | ")})`);
+      status(
+        `Waiting for login… (${pages.map((p) => new URL(p.url()).origin + new URL(p.url()).pathname).join(" | ")})`,
+      );
     }
     if (Date.now() > deadline) {
       if (!keepBrowser) await browser.close();
