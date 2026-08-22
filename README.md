@@ -153,6 +153,7 @@ Example (paper money, confirm only; add `--submit` to send):
 
 ```
 yarn build
+touch .env   # node refuses a missing --env-file
 node --env-file=.env dist/example/futuresPaperOrder.js            # opens Chrome on first run
 FUT_ROOT=/MES FUT_SIDE=BUY FUT_QTY=1 FUT_TYPE=LIMIT FUT_LIMIT=1000 \
   node --env-file=.env dist/example/futuresPaperOrder.js --submit

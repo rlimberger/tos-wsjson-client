@@ -45,7 +45,6 @@ import PositionsMessageHandler from "./services/positionsMessageHandler.js";
 import QuotesMessageHandler from "./services/quotesMessageHandler.js";
 import SchwabLoginMessageHandler from "./services/schwabLoginMessageHandler.js";
 import FutureSeriesMessageHandler, {
-  activeContract,
   FutureSeriesRequest,
   RawFutureSeriesItem,
   RawFutureSeriesResponse,
@@ -53,17 +52,22 @@ import FutureSeriesMessageHandler, {
 import {
   ConfirmOrderMessageHandler,
   ConfirmOrderRequest,
-  draftProblems,
   RawDraftOrderResponse,
   SubmitDraftOrderMessageHandler,
   SubmitOrderRequest,
 } from "./services/draftOrderMessageHandlers.js";
-import { OrderSpec } from "./services/orderTypes.js";
 import {
+  assertTradingSystemAllowed,
+  FALLBACK_GATEWAY_URLS,
   gatewayUrlFor,
   newGatewaySocket,
   TradingSystem,
 } from "./tosWebConfig.js";
+import {
+  FuturesOrderBuilder,
+  FuturesOrderIntent,
+  FuturesOrderResult,
+} from "./futures/futuresOrderBuilder.js";
 import SubmitOrderMessageHandler from "./services/submitOrderMessageHandler.js";
 import SubscribeToAlertMessageHandler from "./services/subscribeToAlertMessageHandler.js";
 import UserPropertiesMessageHandler from "./services/userPropertiesMessageHandler.js";
@@ -125,15 +129,6 @@ const messageHandlers: WebSocketApiMessageHandler<never>[] = [
   new SubmitDraftOrderMessageHandler(),
 ];
 
-export type FuturesOrderResult = {
-  /** Contract actually used in the order legs (resolved from the root). */
-  contract: RawFutureSeriesItem;
-  /** CONFIRM response (draft): cost, allowed tifs/types, warnings, orderId. */
-  confirmation: RawDraftOrderResponse;
-  /** SUBMIT response; undefined when `dryRun` (CONFIRM only). */
-  submission?: RawDraftOrderResponse;
-};
-
 export class RealWsJsonClient implements WsJsonClient {
   private readonly genericHandler = new GenericIncomingMessageHandler();
   private buffer = new BufferedIterator<ParsedPayloadResponse>();
@@ -146,43 +141,47 @@ export class RealWsJsonClient implements WsJsonClient {
   } = {};
 
   constructor(
-    private readonly socket = new WebSocket(
-      "wss://thinkorswim-services.schwab.com/Services/WsJson",
-      {
-        headers: {
-          Pragma: "no-cache",
-          Origin: "https://trade.thinkorswim.com",
-          Upgrade: "websocket",
-          "Cache-Control": "no-cache",
-          Connection: "Upgrade",
-          "Sec-WebSocket-Version": "13",
-          "Sec-WebSocket-Extensions":
-            "permessage-deflate; client_max_window_bits",
-        },
-      },
+    private readonly socket = newGatewaySocket(
+      FALLBACK_GATEWAY_URLS.papermoney,
     ),
     private readonly responseParser = new ResponseParser(this.genericHandler),
+    private readonly clientConfig: {
+      tradingSystem?: TradingSystem;
+      allowLiveTrading?: boolean;
+    } = {},
   ) {}
 
   /**
    * Creates a client connected to the gateway for the given trading system.
-   * Use "PaperMoney" to exercise the full order flow without risking capital —
-   * the paper gateway speaks the identical protocol.
+   * Defaults to PaperMoney. LiveTrading requires `{ allowLiveTrading: true }`.
    */
   static async create({
     tradingSystem = "PaperMoney",
     useInstanceB = false,
+    allowLiveTrading = false,
     gatewayUrl,
   }: {
     tradingSystem?: TradingSystem;
     useInstanceB?: boolean;
+    allowLiveTrading?: boolean;
     /** Explicit gateway URL (e.g. the one captured from the browser session). */
     gatewayUrl?: string;
   } = {}): Promise<RealWsJsonClient> {
+    assertTradingSystemAllowed(tradingSystem, allowLiveTrading);
     const url =
       gatewayUrl ?? (await gatewayUrlFor(tradingSystem, { useInstanceB }));
     logger("connecting to %s gateway %s", tradingSystem, url);
-    return new RealWsJsonClient(newGatewaySocket(url));
+    return new RealWsJsonClient(newGatewaySocket(url), undefined, {
+      tradingSystem,
+      allowLiveTrading,
+    });
+  }
+
+  futuresOrderBuilder(): FuturesOrderBuilder {
+    return new FuturesOrderBuilder(this, {
+      tradingSystem: this.clientConfig.tradingSystem ?? "PaperMoney",
+      allowLiveTrading: this.clientConfig.allowLiveTrading,
+    });
   }
 
   get accessToken() {
@@ -413,46 +412,18 @@ export class RealWsJsonClient implements WsJsonClient {
    */
   async placeFuturesOrder(
     root: string,
-    spec: Omit<OrderSpec, "legs" | "draftKey"> & {
-      side: "BUY" | "SELL";
-      quantity: number;
-      /** Trade a specific contract instead of the active one. */
-      contract?: string;
-    },
+    spec: FuturesOrderIntent,
     { dryRun = true }: { dryRun?: boolean } = {},
   ): Promise<FuturesOrderResult> {
-    const series = await this.futureSeries(root);
-    const contract = spec.contract
-      ? series.find((s) => s.symbol === spec.contract)
-      : activeContract(series);
-    if (!contract) {
-      throw new Error(
-        `no tradeable contract for ${root} (${spec.contract ?? "active"})`,
-      );
-    }
-    const { side, quantity, contract: _c, ...rest } = spec;
-    const orderSpec: OrderSpec = {
-      ...rest,
-      draftKey: root,
-      legs: [{ symbol: contract.symbol, quantity, side }],
-    };
-    const confirmation = await this.confirmOrder({ spec: orderSpec });
-    const problems = draftProblems(confirmation);
-    if (problems.length) {
-      throw new Error(`CONFIRM rejected: ${problems.join("; ")}`);
-    }
-    if (dryRun) return { contract, confirmation };
-    const draft = confirmation.orders?.[0];
-    const tif =
-      orderSpec.tif ??
-      (draft?.tifs
-        ? (draft.tifs.values[draft.tifs.selection] as OrderSpec["tif"])
-        : "DAY");
-    const submission = await this.submitDraftOrder({
-      spec: { ...orderSpec, tif },
-      refOrderId: draft?.orderId,
-    });
-    return { contract, confirmation, submission };
+    return this.futuresOrderBuilder().place(root, spec, { dryRun });
+  }
+
+  /** Full order-event stream (WORKING/QUEUED/FILLED/CANCELED/FINAL/EXECUTION). */
+  orderEvents(accountNumber: string): AsyncIterable<ParsedPayloadResponse> {
+    return this.dispatchHandler(
+      OrderEventsMessageHandler,
+      accountNumber,
+    ).iterable();
   }
 
   workingOrders(accountNumber: string): AsyncIterable<ParsedPayloadResponse> {
@@ -526,7 +497,7 @@ export class RealWsJsonClient implements WsJsonClient {
     const [{ body }] = message.payload;
     if (loginResponse.authenticated) {
       this.state = ChannelState.CONNECTED;
-      logger("Schwab login successful, token=%s", body.token);
+      logger("Schwab login successful");
       this.credentials.accessToken = body.token;
       if (loginResponse.refreshToken) {
         this.credentials.refreshToken = loginResponse.refreshToken;

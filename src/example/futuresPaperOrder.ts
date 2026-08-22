@@ -1,78 +1,102 @@
 /**
  * Futures order scaffold against the thinkorswim PaperMoney gateway.
  *
- *   yarn build
- *   node --env-file=.env dist/example/futuresPaperOrder.js            # CONFIRM only (dry run)
- *   node --env-file=.env dist/example/futuresPaperOrder.js --submit   # actually SUBMIT (paper)
- *   node --env-file=.env dist/example/futuresPaperOrder.js --login    # force a fresh browser login
+ *   node --env-file=.env dist/example/futuresPaperOrder.js
+ *       CONFIRM only (default dry run — no SUBMIT)
+ *   node --env-file=.env dist/example/futuresPaperOrder.js --submit
+ *       CONFIRM then SUBMIT on PaperMoney
+ *   ... --submit --market
+ *       required extra flag for MARKET submits (they can fill immediately)
  *
- * On first run (or --login) a Chrome window opens: log in normally; the script
- * captures the gateway URL, token and account from the SPA's own traffic and
- * saves them to .env (TOS_GATEWAY_URL, TOS_ACCESS_TOKEN, TOS_REFRESH_TOKEN,
- * TOS_ACCOUNT_CODE, TOS_TRADING_SYSTEM). Later runs reuse .env until the token
- * expires (~24h), then fall back to the browser again.
+ * Env: TOS_ACCESS_TOKEN + TOS_REFRESH_TOKEN (from a prior login/schwab), or
+ *      TOS_AUTH_CODE (single-use code from the trade.thinkorswim.com oauth
+ *      redirect — complete login/MFA in your own browser).
+ * Optional: TOS_TRADING_SYSTEM=PaperMoney|LiveTrading (default PaperMoney),
+ *           FUT_ROOT=/MES FUT_SIDE=BUY FUT_QTY=1 FUT_TYPE=LIMIT|MARKET
+ *           FUT_LIMIT=<price> FUT_TIF=DAY TOS_ACCOUNT=<accountCode>
  *
- * Order knobs: FUT_ROOT=/MES FUT_SIDE=BUY FUT_QTY=1 FUT_TYPE=LIMIT|MARKET|STOP|STOPLIMIT
- *              FUT_LIMIT=<price> FUT_STOP=<price> FUT_TIF=DAY|GTC
+ * LiveTrading --submit is refused. Do not pass username/password here.
  */
 import { RealWsJsonClient } from "../client/realWsJsonClient.js";
 import { OrderType, Tif } from "../client/services/orderTypes.js";
 import { TradingSystem } from "../client/tosWebConfig.js";
-import {
-  BrowserSession,
-  captureBrowserSession,
-  saveSessionToDotEnv,
-  sessionFromEnv,
-} from "./browserSession.js";
 
 const env = process.env;
 const argv = process.argv.slice(2);
 const submit = argv.includes("--submit");
-const forceLogin = argv.includes("--login");
-const wanted = (env.TOS_TRADING_SYSTEM as TradingSystem) ?? "PaperMoney";
+const allowMarket = argv.includes("--market");
+const verbose = argv.includes("--verbose");
+const tradingSystem = (env.TOS_TRADING_SYSTEM as TradingSystem) ?? "PaperMoney";
 
-async function connect(session: BrowserSession): Promise<RealWsJsonClient> {
-  const client = await RealWsJsonClient.create({
-    tradingSystem: session.tradingSystem,
-    gatewayUrl: session.gatewayUrl,
-  });
-  await client.authenticateWithAccessToken({
-    accessToken: session.accessToken,
-    refreshToken: session.refreshToken ?? "n/a",
-  });
-  return client;
-}
-
-async function getClient(): Promise<{
-  client: RealWsJsonClient;
-  session: BrowserSession;
-}> {
-  const cached = forceLogin ? undefined : sessionFromEnv();
-  if (cached && cached.tradingSystem === wanted) {
-    try {
-      return { client: await connect(cached), session: cached };
-    } catch (e) {
-      console.warn(`cached session rejected (${String(e)}); opening browser`);
-    }
-  }
-  const session = await captureBrowserSession({ tradingSystem: wanted });
-  saveSessionToDotEnv(session);
-  return { client: await connect(session), session };
+function summarizeConfirmation(body: Record<string, unknown>) {
+  const orders = (body.orders as { orderId?: number; tifs?: { values: string[]; selection: number }; types?: { values: string[]; selection: number }; priceStep?: number; quantityStep?: number; minQty?: number; maxQty?: number; bidPrice?: number; askPrice?: number; midPrice?: number; error?: string; legs?: { symbol: string }[] }[]) ?? [];
+  const confirmation = body.confirmation as
+    | {
+        cost?: number;
+        commission?: number;
+        fee?: number;
+        warnings?: { message: string }[];
+      }
+    | undefined;
+  const first = orders[0];
+  return {
+    errors: [body.message, body.error, body.validationError, first?.error].filter(
+      Boolean,
+    ),
+    warnings: confirmation?.warnings?.map((w) => w.message) ?? [],
+    orderId: first?.orderId,
+    contract: first?.legs?.[0]?.symbol,
+    tif: first?.tifs?.values[first.tifs.selection],
+    type: first?.types?.values[first.types.selection],
+    priceStep: first?.priceStep,
+    quantityStep: first?.quantityStep,
+    minQty: first?.minQty,
+    maxQty: first?.maxQty,
+    bid: first?.bidPrice,
+    ask: first?.askPrice,
+    mid: first?.midPrice,
+    cost: confirmation?.cost,
+    commission: confirmation?.commission,
+    fee: confirmation?.fee,
+  };
 }
 
 async function main() {
-  if (wanted === "LiveTrading" && submit) {
+  if (tradingSystem === "LiveTrading") {
     throw new Error(
-      "refusing to --submit against LiveTrading from the scaffold",
+      "this scaffold refuses LiveTrading. Unset TOS_TRADING_SYSTEM or set it to PaperMoney.",
     );
   }
-  const { client, session } = await getClient();
-  const accountNumber =
-    session.accountCode ??
-    String((await client.userProperties()).body.defaultAccountCode);
-  console.log(
-    `connected: ${session.tradingSystem} ${session.gatewayUrl} account ${accountNumber}`,
-  );
+  const client = await RealWsJsonClient.create({ tradingSystem });
+  if (env.TOS_ACCESS_TOKEN && env.TOS_REFRESH_TOKEN) {
+    await client.authenticateWithAccessToken({
+      accessToken: env.TOS_ACCESS_TOKEN,
+      refreshToken: env.TOS_REFRESH_TOKEN,
+    });
+  } else if (env.TOS_AUTH_CODE) {
+    await client.authenticateWithAuthCode(env.TOS_AUTH_CODE);
+    console.log("authenticated via auth code (token not printed)");
+  } else {
+    throw new Error("set TOS_ACCESS_TOKEN+TOS_REFRESH_TOKEN or TOS_AUTH_CODE");
+  }
+
+  const props = await client.userProperties();
+  const accountNumber = env.TOS_ACCOUNT || String(props.body.defaultAccountCode);
+  console.log("account:", accountNumber, "tradingSystem:", tradingSystem);
+
+  const events = client.orderEvents(accountNumber);
+  void (async () => {
+    for await (const ev of events) {
+      const orders = (ev.body.orders as { orderId?: number; status?: string; eventType?: string }[]) ?? [];
+      for (const o of orders) {
+        console.log("order-event", {
+          orderId: o.orderId,
+          status: o.status,
+          eventType: o.eventType,
+        });
+      }
+    }
+  })();
 
   const root = env.FUT_ROOT ?? "/MES";
   const series = await client.futureSeries(root);
@@ -87,14 +111,16 @@ async function main() {
 
   const orderType = (env.FUT_TYPE as OrderType) ?? "LIMIT";
   const limitPrice = env.FUT_LIMIT ? Number(env.FUT_LIMIT) : undefined;
-  const stopPrice = env.FUT_STOP ? Number(env.FUT_STOP) : undefined;
   if (orderType === "LIMIT" && limitPrice === undefined) {
     throw new Error(
       "FUT_LIMIT is required for LIMIT orders (pick a price far from the market for a safe paper test)",
     );
   }
+  if (orderType === "MARKET" && submit && !allowMarket) {
+    throw new Error("MARKET submit requires --market in addition to --submit");
+  }
 
-  const result = await client.placeFuturesOrder(
+  const result = await client.futuresOrderBuilder().place(
     root,
     {
       accountNumber,
@@ -102,16 +128,39 @@ async function main() {
       quantity: Number(env.FUT_QTY ?? 1),
       orderType,
       limitPrice,
-      stopPrice,
       tif: env.FUT_TIF as Tif | undefined,
     },
     { dryRun: !submit },
   );
 
   console.log("contract:", result.contract.symbol);
-  console.log("CONFIRM:", JSON.stringify(result.confirmation, null, 2));
+  console.log(
+    "CONFIRM:",
+    JSON.stringify(
+      summarizeConfirmation(
+        result.confirmation as unknown as Record<string, unknown>,
+      ),
+      null,
+      2,
+    ),
+  );
+  if (verbose) {
+    console.log("CONFIRM raw keys:", Object.keys(result.confirmation));
+  }
+  if (result.warnings.length) {
+    console.log("warnings:", result.warnings);
+  }
   if (result.submission) {
-    console.log("SUBMIT:", JSON.stringify(result.submission, null, 2));
+    console.log(
+      "SUBMIT:",
+      JSON.stringify(
+        summarizeConfirmation(
+          result.submission as unknown as Record<string, unknown>,
+        ),
+        null,
+        2,
+      ),
+    );
   } else {
     console.log("dry run — re-run with --submit to send to PaperMoney");
   }
@@ -119,6 +168,6 @@ async function main() {
 }
 
 main().catch((e) => {
-  console.error(e);
+  console.error(e instanceof Error ? e.message : e);
   process.exit(1);
 });

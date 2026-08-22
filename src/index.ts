@@ -20,3 +20,8 @@ export * from "./client/services/instrumentSearchMessageHandler.js";
 export * from "./client/services/optionChainDetailsMessageHandler.js";
 export * from "./client/services/optionSeriesQuotesMessageHandler.js";
 export * from "./client/services/alertLookupMessageHandler.js";
+export * from "./client/tosWebConfig.js";
+export * from "./client/services/orderTypes.js";
+export * from "./client/services/futureSeriesMessageHandler.js";
+export * from "./client/services/draftOrderMessageHandlers.js";
+export * from "./client/futures/futuresOrderBuilder.js";

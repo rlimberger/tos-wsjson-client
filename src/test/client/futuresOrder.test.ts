@@ -7,7 +7,13 @@ import FutureSeriesMessageHandler, {
   activeContract,
 } from "../../client/services/futureSeriesMessageHandler";
 import { OrderSpec, validateOrderSpec } from "../../client/services/orderTypes";
-import { resolveGatewayUrl } from "../../client/tosWebConfig";
+import {
+  assertTradingSystemAllowed,
+  LiveTradingDisabledError,
+  resolveGatewayUrl,
+} from "../../client/tosWebConfig";
+import { ORDER_EVENT_TYPES } from "../../client/services/orderEventsMessageHandler";
+import OrderEventsMessageHandler from "../../client/services/orderEventsMessageHandler";
 import GenericIncomingMessageHandler from "../../client/services/genericIncomingMessageHandler";
 
 const account = "12345678";
@@ -179,6 +185,31 @@ describe("futures order builders", () => {
     ).toEqual(["x", "bad price"]);
   });
 
+  it("omits limitPrice on MARKET CONFIRM and SUBMIT", () => {
+    const market = { ...mesLimit, orderType: "MARKET" as const, limitPrice: undefined };
+    const confirm = new ConfirmOrderMessageHandler().buildRequest({
+      spec: market,
+    }).payload[0].params.orders[0];
+    expect(confirm).toEqual({
+      requestType: "INIT_STOCK",
+      orderType: "MARKET",
+      legs: [{ symbol: "/MESU26", quantity: 1 }],
+    });
+    const submit = new SubmitDraftOrderMessageHandler().buildRequest({
+      spec: market,
+    }).payload[0].params.orders[0];
+    expect(submit).not.toHaveProperty("limitPrice");
+    expect(submit.orderType).toBe("MARKET");
+    expect(submit.tag).toBe("TOSWeb");
+    expect(submit.tif).toBe("DAY");
+  });
+
+  it("treats an empty orders list as a draft problem", () => {
+    expect(draftProblems({ orders: [] })).toEqual([
+      "CONFIRM returned no orders",
+    ]);
+  });
+
   it("selects the paper-money gateway", () => {
     const urls = {
       livetradingA: "wss://a",
@@ -190,5 +221,31 @@ describe("futures order builders", () => {
     expect(resolveGatewayUrl("LiveTrading", urls, { useInstanceB: true })).toBe(
       "wss://b",
     );
+  });
+
+  it("gates LiveTrading unless explicitly allowed", () => {
+    expect(() => assertTradingSystemAllowed("LiveTrading")).toThrow(
+      LiveTradingDisabledError,
+    );
+    expect(() =>
+      assertTradingSystemAllowed("LiveTrading", true),
+    ).not.toThrow();
+    expect(() => assertTradingSystemAllowed("PaperMoney")).not.toThrow();
+  });
+
+  it("subscribes to the six-type order_events feed", () => {
+    expect(
+      new OrderEventsMessageHandler().buildRequest("12345678"),
+    ).toEqual({
+      payload: [
+        {
+          header: { service: "order_events", id: "order_events", ver: 0 },
+          params: {
+            account: "12345678",
+            types: [...ORDER_EVENT_TYPES],
+          },
+        },
+      ],
+    });
   });
 });
