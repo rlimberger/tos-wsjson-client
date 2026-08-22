@@ -182,19 +182,36 @@ async function main() {
     }
   })();
 
-  /** The submit response echoes the draft (orderId 0); the real id arrives via order_events. */
+  /**
+   * The submit response echoes the draft (orderId 0); the real id only arrives
+   * via order_events. Identify our order by what we actually asked for —
+   * contract, side, quantity and price — because the account may already hold
+   * other orders on the same contract (and the initial snapshot can land after
+   * the submit, so "ids seen so far" is not a reliable baseline).
+   */
   const awaitPlacedOrder = async (
-    contract: string,
+    want: {
+      contract: string;
+      side: string;
+      quantity: number;
+      price?: number;
+    },
     timeoutMs = 10_000,
   ): Promise<LiveOrder | undefined> => {
     const deadline = Date.now() + timeoutMs;
+    const samePrice = (o: LiveOrder) =>
+      want.price === undefined ||
+      (typeof o.price === "number" && Math.abs(o.price - want.price) < 1e-6);
+    const matches = (o: LiveOrder) =>
+      !!o.orderId &&
+      (o.legs?.[0]?.symbol === want.contract ||
+        o.descriptionToShare?.includes(want.contract)) &&
+      (o.side ?? "").toUpperCase().startsWith(want.side.toUpperCase()[0]) &&
+      Math.abs(Math.abs(o.quantity ?? 0) - want.quantity) < 1e-6 &&
+      samePrice(o);
     for (;;) {
-      const match = seenOrders.find(
-        (o) =>
-          o.orderId &&
-          (o.legs?.[0]?.symbol === contract ||
-            o.descriptionToShare?.includes(contract)),
-      );
+      // Newest event wins, so a replace reports the replacement order.
+      const match = [...seenOrders].reverse().find(matches);
       if (match || Date.now() > deadline) return match;
       await new Promise((r) => setTimeout(r, 250));
     }
@@ -265,7 +282,12 @@ async function main() {
         2,
       ),
     );
-    const placed = await awaitPlacedOrder(result.contract.symbol);
+    const placed = await awaitPlacedOrder({
+      contract: result.contract.symbol,
+      side: (env.FUT_SIDE as string) ?? "BUY",
+      quantity: Number(env.FUT_QTY ?? 1),
+      price: limitPrice,
+    });
     if (placed) {
       console.log("PLACED:", {
         orderId: placed.orderId,
