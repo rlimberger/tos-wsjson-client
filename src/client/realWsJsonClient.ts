@@ -80,6 +80,7 @@ import WebSocketApiMessageHandler from "./services/webSocketApiMessageHandler.js
 import WorkingOrdersMessageHandler from "./services/workingOrdersMessageHandler.js";
 import {
   ParsedPayloadResponse,
+  RawPayloadRequest,
   RawPayloadResponse,
   WsJsonRawMessage,
 } from "./tdaWsJsonTypes.js";
@@ -106,6 +107,36 @@ export enum ChannelState {
 }
 
 const logger = debug("realWsJsonClient");
+
+/** Services whose requests are long-lived subscriptions and are safe to replay
+ *  after a reconnect. Order-placing services are deliberately excluded. */
+const REPLAYABLE_SERVICES: ReadonlySet<string> = new Set([
+  "quotes",
+  "quotes/options",
+  "positions",
+  "order_events",
+  "chart",
+  "market_depth",
+  "optionSeries/quotes",
+  "alerts/subscribe",
+]);
+
+export type ConnectionEvent =
+  | { type: "connected"; reconnected: boolean }
+  | { type: "disconnected"; reason?: string }
+  | { type: "reconnecting"; attempt: number; delayMs: number }
+  | { type: "gaveUp"; attempts: number };
+
+export type WatchdogOptions = {
+  /** Reconnect when no frame (heartbeat included) arrives for this long. The
+   *  gateway sends a heartbeat every ~2s, so 30s mirrors the ToS web UI. */
+  heartbeatTimeoutMs?: number;
+  /** Attempts before giving up (ToS web uses 3). 0 disables auto-reconnect. */
+  maxReconnectAttempts?: number;
+  /** Fixed backoff instead of the ToS web-like random 10-20s (useful in tests). */
+  reconnectDelayMs?: number;
+  onConnectionEvent?: (event: ConnectionEvent) => void;
+};
 
 const messageHandlers: WebSocketApiMessageHandler<never>[] = [
   new CancelAlertMessageHandler(),
@@ -141,6 +172,14 @@ export class RealWsJsonClient implements WsJsonClient {
   private iterator = new MulticastIterator(this.buffer);
   private state = ChannelState.DISCONNECTED;
   private bufferEnded = false;
+  private lastMessageAt = 0;
+  private watchdogTimer?: ReturnType<typeof setInterval>;
+  private reconnectTimer?: ReturnType<typeof setTimeout>;
+  private reconnectAttempts = 0;
+  private reconnecting = false;
+  private closingIntentionally = false;
+  /** Streaming requests to replay after a reconnect, keyed by header id. */
+  private readonly activeSubscriptions = new Map<string, RawPayloadRequest>();
   private credentials: {
     authCode?: string;
     accessToken?: string;
@@ -150,13 +189,14 @@ export class RealWsJsonClient implements WsJsonClient {
   private readonly responseParser: ResponseParser;
 
   constructor(
-    private readonly socket = newGatewaySocket(
-      FALLBACK_GATEWAY_URLS.papermoney,
-    ),
+    private socket = newGatewaySocket(FALLBACK_GATEWAY_URLS.papermoney),
     responseParser?: ResponseParser,
     private readonly clientConfig: {
       tradingSystem?: TradingSystem;
       allowLiveTrading?: boolean;
+      /** Enables reconnects: the watchdog rebuilds the socket from this URL. */
+      gatewayUrl?: string;
+      watchdog?: WatchdogOptions;
     } = {},
   ) {
     this.responseParser =
@@ -172,12 +212,14 @@ export class RealWsJsonClient implements WsJsonClient {
     useInstanceB = false,
     allowLiveTrading = false,
     gatewayUrl,
+    watchdog,
   }: {
     tradingSystem?: TradingSystem;
     useInstanceB?: boolean;
     allowLiveTrading?: boolean;
     /** Explicit gateway URL (e.g. the one captured from the browser session). */
     gatewayUrl?: string;
+    watchdog?: WatchdogOptions;
   } = {}): Promise<RealWsJsonClient> {
     assertTradingSystemAllowed(tradingSystem, allowLiveTrading);
     const url =
@@ -186,6 +228,8 @@ export class RealWsJsonClient implements WsJsonClient {
     return new RealWsJsonClient(newGatewaySocket(url), undefined, {
       tradingSystem,
       allowLiveTrading,
+      gatewayUrl: url,
+      watchdog,
     });
   }
 
@@ -243,17 +287,25 @@ export class RealWsJsonClient implements WsJsonClient {
     }
   }
   private doConnect(): Promise<RawLoginResponseBody> {
+    return new Promise((resolve, reject) => this.wireSocket(resolve, reject));
+  }
+
+  private wireSocket(
+    resolve: (value: RawLoginResponseBody) => void,
+    reject: (reason?: string) => void,
+  ) {
     const { socket } = this;
-    return new Promise((resolve, reject) => {
-      if (socket.readyState === WebSocket.OPEN) {
-        this.sendMessage(CONNECTION_REQUEST_MESSAGE);
-      }
-      socket.onopen = () => this.sendMessage(CONNECTION_REQUEST_MESSAGE);
-      socket.onclose = (event) =>
-        debugLog("connection closed: ", event?.reason);
-      socket.onmessage = ({ data }) =>
-        this.onMessage(data as string, resolve, reject);
-    });
+    if (socket.readyState === WebSocket.OPEN) {
+      this.sendMessage(CONNECTION_REQUEST_MESSAGE);
+    }
+    socket.onopen = () => this.sendMessage(CONNECTION_REQUEST_MESSAGE);
+    socket.onclose = (event) => {
+      debugLog("connection closed: ", event?.reason);
+      this.emitConnectionEvent({ type: "disconnected", reason: event?.reason });
+      if (!this.closingIntentionally) this.scheduleReconnect();
+    };
+    socket.onmessage = ({ data }) =>
+      this.onMessage(data as string, resolve, reject);
   }
 
   private onMessage(
@@ -262,6 +314,7 @@ export class RealWsJsonClient implements WsJsonClient {
     reject: (reason?: string) => void,
   ) {
     const { responseParser, buffer } = this;
+    this.lastMessageAt = Date.now();
     const message = JSON.parse(data) as WsJsonRawMessage;
     logger("⬅️\treceived %O", message);
     if (isConnectionResponse(message)) {
@@ -503,7 +556,12 @@ export class RealWsJsonClient implements WsJsonClient {
     args: Req,
   ): Observable<NonNullable<ParsedPayloadResponse>> {
     this.ensureConnected();
-    this.sendMessage(handler.buildRequest(args));
+    const request = handler.buildRequest(args);
+    if (REPLAYABLE_SERVICES.has(handler.service)) {
+      const id = request.payload[0]?.header?.id;
+      if (id) this.activeSubscriptions.set(id, request);
+    }
+    this.sendMessage(request);
     const wantId = handler.requestId?.(args);
     return deferredWrap(() => this.iterator).filter(
       (msg) =>
@@ -555,6 +613,7 @@ export class RealWsJsonClient implements WsJsonClient {
     const [{ body }] = message.payload;
     if (loginResponse.successful) {
       this.state = ChannelState.CONNECTED;
+      this.onConnected();
       resolve(body);
     } else {
       this.state = ChannelState.ERROR;
@@ -571,9 +630,142 @@ export class RealWsJsonClient implements WsJsonClient {
     return this.dispatch(handler, arg);
   }
 
+  /** Fires on every successful login, including after a reconnect. */
+  private onConnected() {
+    const reconnected = this.reconnecting;
+    this.reconnecting = false;
+    this.reconnectAttempts = 0;
+    this.lastMessageAt = Date.now();
+    this.startWatchdog();
+    this.emitConnectionEvent({ type: "connected", reconnected });
+    if (reconnected) this.replaySubscriptions();
+  }
+
+  private emitConnectionEvent(event: ConnectionEvent) {
+    logger("connection event %O", event);
+    this.clientConfig.watchdog?.onConnectionEvent?.(event);
+  }
+
+  private get heartbeatTimeoutMs(): number {
+    return this.clientConfig.watchdog?.heartbeatTimeoutMs ?? 30_000;
+  }
+
+  private get maxReconnectAttempts(): number {
+    return this.clientConfig.watchdog?.maxReconnectAttempts ?? 3;
+  }
+
+  /**
+   * The gateway sends `{"heartbeat": <ms>}` about every 2s. If nothing arrives
+   * for `heartbeatTimeoutMs` the socket is considered dead and we reconnect —
+   * same policy as the ToS web UI (30s silence, <=3 attempts, 10-20s backoff).
+   */
+  private startWatchdog() {
+    if (this.watchdogTimer || this.maxReconnectAttempts === 0) return;
+    this.watchdogTimer = setInterval(() => {
+      if (this.state !== ChannelState.CONNECTED || this.reconnecting) return;
+      const silentFor = Date.now() - this.lastMessageAt;
+      if (silentFor > this.heartbeatTimeoutMs) {
+        logger("no frames for %dms, reconnecting", silentFor);
+        this.scheduleReconnect();
+      }
+    }, 5_000);
+    this.watchdogTimer.unref?.();
+  }
+
+  private stopWatchdog() {
+    if (this.watchdogTimer) clearInterval(this.watchdogTimer);
+    this.watchdogTimer = undefined;
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = undefined;
+  }
+
+  /** Milliseconds to wait before attempt N (ToS web: random 10-20s). */
+  private reconnectDelayMs(): number {
+    return (
+      this.clientConfig.watchdog?.reconnectDelayMs ??
+      10_000 + Math.floor(Math.random() * 10_000)
+    );
+  }
+
+  private scheduleReconnect() {
+    const { gatewayUrl } = this.clientConfig;
+    if (
+      this.reconnecting ||
+      this.bufferEnded ||
+      this.closingIntentionally ||
+      this.maxReconnectAttempts === 0
+    ) {
+      return;
+    }
+    if (!gatewayUrl) {
+      logger("no gatewayUrl configured; cannot reconnect");
+      return;
+    }
+    if (!this.credentials.accessToken) {
+      logger("no access token; cannot reconnect");
+      return;
+    }
+    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+      this.state = ChannelState.ERROR;
+      this.stopWatchdog();
+      this.emitConnectionEvent({
+        type: "gaveUp",
+        attempts: this.reconnectAttempts,
+      });
+      return;
+    }
+    this.reconnecting = true;
+    this.reconnectAttempts += 1;
+    const delayMs = this.reconnectDelayMs();
+    this.emitConnectionEvent({
+      type: "reconnecting",
+      attempt: this.reconnectAttempts,
+      delayMs,
+    });
+    this.reconnectTimer = setTimeout(
+      () => this.doReconnect(gatewayUrl),
+      delayMs,
+    );
+    this.reconnectTimer.unref?.();
+  }
+
+  private doReconnect(gatewayUrl: string) {
+    try {
+      this.socket?.close();
+    } catch {
+      /* already closed */
+    }
+    this.state = ChannelState.CONNECTING;
+    this.socket = newGatewaySocket(gatewayUrl);
+    // Keep the existing buffer so consumers' `for await` loops survive.
+    this.wireSocket(
+      () => logger("reconnected and re-authenticated"),
+      (reason) => {
+        logger("reconnect login failed: %s", reason);
+        this.reconnecting = false;
+        this.scheduleReconnect();
+      },
+    );
+  }
+
+  private replaySubscriptions() {
+    for (const [id, request] of this.activeSubscriptions) {
+      logger("replaying subscription %s", id);
+      this.sendMessage(request);
+    }
+  }
+
+  /** Seconds since the last frame from the gateway (heartbeats included). */
+  get secondsSinceLastMessage(): number {
+    return this.lastMessageAt ? (Date.now() - this.lastMessageAt) / 1000 : -1;
+  }
+
   disconnect() {
     if (this.bufferEnded) return;
     this.bufferEnded = true;
+    this.closingIntentionally = true;
+    this.stopWatchdog();
+    this.activeSubscriptions.clear();
     this.socket?.close();
     this.state = ChannelState.DISCONNECTED;
     // This ensures that listeners will resolve the promise cleanly from any `for await` loops
