@@ -70,7 +70,15 @@ export async function captureBrowserSession({
 }: CaptureOptions = {}): Promise<BrowserSession> {
   const pp = puppeteer as unknown as PuppeteerExtra;
   pp.use(StealthPlugin());
+  const executablePath =
+    process.env.PUPPETEER_EXECUTABLE_PATH ??
+    [
+      "/usr/bin/google-chrome-stable",
+      "/usr/bin/google-chrome",
+      "/usr/bin/chromium",
+    ].find((p) => existsSync(p));
   const browser: Browser = await pp.launch({
+    executablePath,
     headless: false,
     defaultViewport: null,
     args: [
