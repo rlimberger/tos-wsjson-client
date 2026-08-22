@@ -20,5 +20,6 @@ export type ApiService =
   | "market_depth"
   | "watchlist/get"
   | "future_series"
+  | "accounts"
   | "instruments"
   | "fake"; // testing only

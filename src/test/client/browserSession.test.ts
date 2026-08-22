@@ -7,7 +7,10 @@ describe("browserSession env round-trip", () => {
       TOS_ACCESS_TOKEN: "tok",
       TOS_ACCOUNT_CODE: "123",
     } as NodeJS.ProcessEnv);
-    expect(s).toMatchObject({ tradingSystem: "PaperMoney", accountCode: "123" });
+    expect(s).toMatchObject({
+      tradingSystem: "PaperMoney",
+      accountCode: "123",
+    });
     expect(sessionFromEnv({} as NodeJS.ProcessEnv)).toBeUndefined();
   });
 });

@@ -44,6 +44,11 @@ import PlaceOrderMessageHandler, {
 import PositionsMessageHandler from "./services/positionsMessageHandler.js";
 import QuotesMessageHandler from "./services/quotesMessageHandler.js";
 import SchwabLoginMessageHandler from "./services/schwabLoginMessageHandler.js";
+import AccountsMessageHandler, {
+  accountCodeOf,
+  RawAccountItem,
+  RawAccountsResponse,
+} from "./services/accountsMessageHandler.js";
 import FutureSeriesMessageHandler, {
   FutureSeriesRequest,
   RawFutureSeriesItem,
@@ -125,6 +130,7 @@ const messageHandlers: WebSocketApiMessageHandler<never>[] = [
   new MarketDepthMessageHandler(),
   new GetWatchlistMessageHandler(),
   new FutureSeriesMessageHandler(),
+  new AccountsMessageHandler(),
   new ConfirmOrderMessageHandler(),
   new SubmitDraftOrderMessageHandler(),
 ];
@@ -376,6 +382,27 @@ export class RealWsJsonClient implements WsJsonClient {
     request: Required<PlaceLimitOrderRequestParams>,
   ): Promise<ParsedPayloadResponse> {
     return this.dispatchHandler(SubmitOrderMessageHandler, request).promise();
+  }
+
+  /** Lists the accounts on the connected (live or paper) session. */
+  async accounts(): Promise<RawAccountItem[]> {
+    const res = await this.dispatchHandler(
+      AccountsMessageHandler,
+      undefined as void,
+    ).promise();
+    return (res.body as unknown as RawAccountsResponse).items ?? [];
+  }
+
+  /**
+   * Best-effort account code for placing orders: user_properties.defaultAccountCode
+   * if present, else the first account from the `accounts` service.
+   */
+  async resolveAccountCode(): Promise<string | undefined> {
+    const props = await this.userProperties();
+    const fromProps = props.body.defaultAccountCode;
+    if (fromProps) return String(fromProps);
+    const accts = await this.accounts();
+    return accts.map(accountCodeOf).find((c) => !!c);
   }
 
   /** Lists the tradeable contracts for a futures root such as "/MES". */
