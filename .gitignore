@@ -112,3 +112,4 @@ dist
 .tern-port
 .DS_Store
 puppeteer-data/
+apps/order-watch/target/

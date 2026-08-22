@@ -10,6 +10,11 @@ type StoredData = Record<string, any>;
 export default class GenericIncomingMessageHandler {
   private readonly dataStore: Record<string, StoredData> = {};
 
+  /** Drop patched documents so a reconnect snapshot cannot mix with a stale store. */
+  clear() {
+    for (const key of Object.keys(this.dataStore)) delete this.dataStore[key];
+  }
+
   parseResponse({ payload }: RawPayloadResponse): ParsedPayloadResponse[] {
     if (!payload) return [];
     const parsed: ParsedPayloadResponse[] = [];

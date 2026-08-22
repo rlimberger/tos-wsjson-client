@@ -16,97 +16,21 @@
 import { WebSocketServer, WebSocket as WsSocket } from "ws";
 import { RealWsJsonClient } from "../client/realWsJsonClient.js";
 import {
+  DisplayOrder,
+  ordersFromEventsBody,
+} from "../client/orders/workingOrderBook.js";
+import {
   BrowserSession,
   captureBrowserSession,
   saveSessionToDotEnv,
   sessionFromEnv,
 } from "./browserSession.js";
 
-export type OrderRow = {
-  orderId: number;
-  symbol: string;
-  side: string;
-  quantity: number;
-  filledQuantity: number;
-  price?: number;
-  orderType?: string;
-  tif?: string;
-  status: string;
-  active: boolean;
-  description: string;
-  updatedAt: number;
-};
-
-/** Statuses that mean "still live at the exchange". */
-const ACTIVE_STATUSES = new Set([
-  "WORKING",
-  "QUEUED",
-  "PENDING",
-  "WAIT TRG",
-  "WAIT_TRIGGER",
-  "OPEN",
-]);
-
-type RawOrder = {
-  orderId?: number;
-  status?: string;
-  eventType?: string;
-  side?: string;
-  quantity?: number;
-  filledQuantity?: number;
-  price?: number;
-  limitPrice?: number;
-  orderType?: string;
-  tif?: string;
-  legs?: { symbol?: string }[];
-  rootSymbol?: string;
-  descriptionToShare?: string;
-  description?: string;
-  eventTime?: number;
-};
-
-export function toOrderRow(o: RawOrder, now = Date.now()): OrderRow {
-  const status = (o.status ?? o.eventType ?? "UNKNOWN").toUpperCase();
-  return {
-    orderId: o.orderId ?? 0,
-    symbol: o.legs?.[0]?.symbol ?? o.rootSymbol ?? "",
-    side: o.side ?? "",
-    quantity: o.quantity ?? 0,
-    filledQuantity: o.filledQuantity ?? 0,
-    price: o.price ?? o.limitPrice,
-    orderType: o.orderType,
-    tif: o.tif,
-    status,
-    active: ACTIVE_STATUSES.has(status),
-    description: o.descriptionToShare ?? o.description ?? "",
-    updatedAt: o.eventTime ?? now,
-  };
-}
-
-export class OrderFeed {
-  private readonly rows = new Map<number, OrderRow>();
-
-  /** Merges an order_events payload; returns the full current book. */
-  apply(orders: RawOrder[], now = Date.now()): OrderRow[] {
-    for (const raw of orders) {
-      const row = toOrderRow(raw, now);
-      if (!row.orderId) continue;
-      const prev = this.rows.get(row.orderId);
-      // Later events win; a terminal status must never be overwritten by a
-      // stale WORKING snapshot replayed after a reconnect.
-      if (prev && !prev.active && row.active) continue;
-      this.rows.set(row.orderId, { ...prev, ...row });
-    }
-    return this.snapshot();
-  }
-
-  snapshot(): OrderRow[] {
-    return [...this.rows.values()].sort(
-      (a, b) =>
-        Number(b.active) - Number(a.active) || b.updatedAt - a.updatedAt,
-    );
-  }
-}
+/** The feed re-broadcasts the shared working-order book (see
+ *  client/orders/workingOrderBook.ts): WORKING/QUEUED upsert, CANCELED/FILLED/
+ *  FINAL remove, EXECUTION updates the fill quantity. A cancel made in the web
+ *  UI therefore disappears from every connected watcher. */
+export type OrderRow = DisplayOrder;
 
 async function resolveSession(): Promise<BrowserSession> {
   const cached = sessionFromEnv();
@@ -118,10 +42,10 @@ async function resolveSession(): Promise<BrowserSession> {
 
 export async function startOrderFeedServer(port = 8787) {
   const session = await resolveSession();
-  const feed = new OrderFeed();
   const wss = new WebSocketServer({ host: "127.0.0.1", port });
   const clients = new Set<WsSocket>();
   let connectionState = "connecting";
+  let latestOrders: DisplayOrder[] = [];
 
   const broadcast = (msg: unknown) => {
     const data = JSON.stringify(msg);
@@ -169,7 +93,7 @@ export async function startOrderFeedServer(port = 8787) {
     ws.send(
       JSON.stringify({
         type: "orders",
-        orders: feed.snapshot(),
+        orders: latestOrders,
         at: Date.now(),
       }),
     );
@@ -183,10 +107,9 @@ export async function startOrderFeedServer(port = 8787) {
 
   void (async () => {
     for await (const ev of client.orderEvents(account)) {
-      const orders = feed.apply((ev.body.orders as RawOrder[]) ?? []);
-      broadcast({ type: "orders", orders, at: Date.now() });
-      const active = orders.filter((o) => o.active).length;
-      console.log(`[feed] ${orders.length} orders (${active} active)`);
+      latestOrders = ordersFromEventsBody(ev.body);
+      broadcast({ type: "orders", orders: latestOrders, at: Date.now() });
+      console.log(`[feed] ${latestOrders.length} working order(s)`);
     }
   })();
 
@@ -198,7 +121,7 @@ export async function startOrderFeedServer(port = 8787) {
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
-  return { client, wss, feed };
+  return { client, wss };
 }
 
 if (process.argv[1]?.endsWith("orderFeedServer.js")) {

@@ -1,9 +1,20 @@
 import {
   ConnectionResponse,
+  RawHeartbeatResponse,
   RawPayloadResponse,
   WsJsonRawMessage,
 } from "./tdaWsJsonTypes.js";
 import { RawLoginResponse } from "./services/loginMessageHandler.js";
+
+export function isHeartbeat(
+  message: WsJsonRawMessage,
+): message is RawHeartbeatResponse {
+  return (
+    typeof (message as RawHeartbeatResponse).heartbeat === "number" &&
+    !("payload" in message) &&
+    !("session" in message)
+  );
+}
 
 export function isPayloadResponse(
   response: WsJsonRawMessage,

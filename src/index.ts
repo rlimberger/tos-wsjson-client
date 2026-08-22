@@ -25,3 +25,4 @@ export * from "./client/services/orderTypes.js";
 export * from "./client/services/futureSeriesMessageHandler.js";
 export * from "./client/services/draftOrderMessageHandlers.js";
 export * from "./client/futures/futuresOrderBuilder.js";
+export * from "./client/orders/workingOrderBook.js";

@@ -148,6 +148,64 @@ export class FuturesOrderBuilder {
     });
   }
 
+  /**
+   * Cancel-replace of a live order: CONFIRM with requestType
+   * INIT_CANCEL_REPLACE + the live orderId, then SUBMIT EDIT_ORDER against the
+   * same orderId — the sequence the ToS web ticket uses when you edit a
+   * working order. `dryRun` (default) stops after CONFIRM.
+   */
+  async replace(
+    orderId: number,
+    root: string,
+    intent: FuturesOrderIntent,
+    { dryRun = true }: { dryRun?: boolean } = {},
+  ): Promise<FuturesOrderResult> {
+    if (!Number.isFinite(orderId) || orderId <= 0) {
+      throw new Error("replace requires the live orderId to modify");
+    }
+    const { side, quantity, contract: contractSymbol, ...rest } = intent;
+    const normalized = normalizeFuturesRoot(root);
+    const contract = await this.resolve(normalized, contractSymbol);
+    const spec: OrderSpec = {
+      ...rest,
+      draftKey: normalized,
+      legs: [{ symbol: contract.symbol, quantity, side }],
+    };
+    const confirmation = await this.transport.confirmOrder({
+      spec,
+      requestType: "INIT_CANCEL_REPLACE",
+      refOrderId: orderId,
+    });
+    const draft = ConfirmedFuturesDraft.fromSuccessful(
+      contract,
+      confirmation,
+      spec,
+    );
+    const result: FuturesOrderResult = {
+      contract,
+      confirmation,
+      warnings: draft.warnings,
+    };
+    if (dryRun) return result;
+    if (this.tradingSystem === "LiveTrading" && !this.allowLiveTrading) {
+      throw new Error(
+        "LiveTrading SUBMIT is gated off. Pass { allowLiveTrading: true }.",
+      );
+    }
+    const tif =
+      spec.tif ??
+      (confirmation.orders?.[0]?.tifs
+        ? confirmation.orders[0].tifs!.values[
+            confirmation.orders[0].tifs!.selection
+          ]
+        : "DAY");
+    result.submission = await this.transport.submitDraftOrder({
+      spec: { ...spec, tif },
+      refOrderId: orderId,
+    });
+    return result;
+  }
+
   async place(
     root: string,
     intent: FuturesOrderIntent,

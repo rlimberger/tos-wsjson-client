@@ -108,6 +108,18 @@ const draft = await client.futuresOrderBuilder().confirm("/MES", {
 // await client.futuresOrderBuilder().submit(draft);
 ```
 
+# Working-order watcher
+
+A heartbeat watchdog keeps the PaperMoney socket alive (30s of silence → reconnect, replay `order_events`, up to 3 attempts). The GPUI window shows **working** orders only: a cancel or fill from thinkorswim Web drops the row when the matching event arrives.
+
+```
+# sidecar only (NDJSON on stdout)
+node --env-file=.env dist/example/orderWatcher.js
+
+# desktop window (spawns the sidecar)
+cargo run --manifest-path apps/order-watch/Cargo.toml --release
+```
+
 # Supported APIs
 
 - ✅ Authentication via access token

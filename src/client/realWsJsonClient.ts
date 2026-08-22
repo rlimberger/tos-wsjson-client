@@ -8,6 +8,7 @@ import {
 } from "obgen";
 import {
   isConnectionResponse,
+  isHeartbeat,
   isLoginResponse,
   isSchwabLoginResponse,
 } from "./messageTypeHelpers.js";
@@ -299,6 +300,9 @@ export class RealWsJsonClient implements WsJsonClient {
       this.sendMessage(CONNECTION_REQUEST_MESSAGE);
     }
     socket.onopen = () => this.sendMessage(CONNECTION_REQUEST_MESSAGE);
+    socket.onerror = () => {
+      /* closed while connecting (tests, reconnect races) */
+    };
     socket.onclose = (event) => {
       debugLog("connection closed: ", event?.reason);
       this.emitConnectionEvent({ type: "disconnected", reason: event?.reason });
@@ -317,7 +321,9 @@ export class RealWsJsonClient implements WsJsonClient {
     this.lastMessageAt = Date.now();
     const message = JSON.parse(data) as WsJsonRawMessage;
     logger("⬅️\treceived %O", message);
-    if (isConnectionResponse(message)) {
+    if (isHeartbeat(message)) {
+      return;
+    } else if (isConnectionResponse(message)) {
       this.authenticate();
     } else if (isLoginResponse(message)) {
       this.handleLoginResponse(message, resolve, reject);
@@ -595,6 +601,7 @@ export class RealWsJsonClient implements WsJsonClient {
       if (loginResponse.refreshToken) {
         this.credentials.refreshToken = loginResponse.refreshToken;
       }
+      this.onConnected();
       resolve(body);
     } else {
       this.state = ChannelState.ERROR;
@@ -661,6 +668,10 @@ export class RealWsJsonClient implements WsJsonClient {
    */
   private startWatchdog() {
     if (this.watchdogTimer || this.maxReconnectAttempts === 0) return;
+    const intervalMs = Math.min(
+      5_000,
+      Math.max(100, Math.floor(this.heartbeatTimeoutMs / 2)),
+    );
     this.watchdogTimer = setInterval(() => {
       if (this.state !== ChannelState.CONNECTED || this.reconnecting) return;
       const silentFor = Date.now() - this.lastMessageAt;
@@ -668,7 +679,7 @@ export class RealWsJsonClient implements WsJsonClient {
         logger("no frames for %dms, reconnecting", silentFor);
         this.scheduleReconnect();
       }
-    }, 5_000);
+    }, intervalMs);
     this.watchdogTimer.unref?.();
   }
 
@@ -736,6 +747,7 @@ export class RealWsJsonClient implements WsJsonClient {
       /* already closed */
     }
     this.state = ChannelState.CONNECTING;
+    this.genericHandler.clear();
     this.socket = newGatewaySocket(gatewayUrl);
     // Keep the existing buffer so consumers' `for await` loops survive.
     this.wireSocket(
@@ -766,7 +778,11 @@ export class RealWsJsonClient implements WsJsonClient {
     this.closingIntentionally = true;
     this.stopWatchdog();
     this.activeSubscriptions.clear();
-    this.socket?.close();
+    try {
+      this.socket?.close();
+    } catch {
+      /* mock sockets can throw if they never fully opened */
+    }
     this.state = ChannelState.DISCONNECTED;
     // This ensures that listeners will resolve the promise cleanly from any `for await` loops
     this.buffer.end();

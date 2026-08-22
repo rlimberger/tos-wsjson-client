@@ -18,7 +18,9 @@
     "test": "jest",
     "ci": "yarn check_prettier && yarn build && yarn lint && yarn test",
     "paper-futures": "node --env-file=.env dist/example/futuresPaperOrder.js",
-    "paper-login": "node dist/example/browserSession.js PaperMoney"
+    "paper-login": "node dist/example/browserSession.js PaperMoney",
+    "watch-orders": "node --env-file=.env dist/example/orderWatcher.js",
+    "order-watch": "cargo run --manifest-path apps/order-watch/Cargo.toml --release"
   },
   "dependencies": {
     "debug": "^4.3.4",
