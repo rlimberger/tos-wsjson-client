@@ -131,7 +131,17 @@ async function main() {
     env.TOS_ACCOUNT ||
     env.TOS_ACCOUNT_CODE ||
     session.accountCode ||
-    String((await client.userProperties()).body.defaultAccountCode);
+    (await client.resolveAccountCode());
+  if (!accountNumber) {
+    const accts = await client.accounts();
+    console.error(
+      "could not resolve an account code for this session; `accounts` returned:",
+      JSON.stringify(accts, null, 2),
+    );
+    throw new Error(
+      "no account code — set TOS_ACCOUNT=<paper account> and re-run",
+    );
+  }
   console.log(
     `connected: ${session.tradingSystem} ${session.gatewayUrl} account ${accountNumber}`,
   );
