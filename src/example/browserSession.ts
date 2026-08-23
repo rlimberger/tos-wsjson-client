@@ -93,6 +93,11 @@ export async function captureBrowserSession({
   const executablePath =
     process.env.PUPPETEER_EXECUTABLE_PATH ??
     [
+      // macOS
+      "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+      "/Applications/Chromium.app/Contents/MacOS/Chromium",
+      "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+      // Linux
       "/usr/bin/google-chrome-stable",
       "/usr/bin/google-chrome",
       "/usr/bin/chromium",
