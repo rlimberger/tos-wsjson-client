@@ -27,6 +27,11 @@
  *   { "type": "connection", "state": "connected" | "reconnecting" | "disconnected" | "gaveUp" }
  * A fresh client immediately receives `session`, the latest `orders`, and the
  * current `connection` state.
+ *
+ * Auth is self-healing: if the stored token is missing, rejected or expires
+ * mid-session, the bridge opens a real browser window for an interactive login,
+ * saves the new token and rebuilds the session. Watchers see
+ * `connection: "authenticating"` while that is happening.
  */
 import { WebSocketServer, WebSocket as WsSocket } from "ws";
 import { RealWsJsonClient } from "../client/realWsJsonClient.js";
@@ -52,17 +57,49 @@ import {
  *  UI therefore disappears from every connected watcher. */
 export type OrderRow = DisplayOrder;
 
-async function resolveSession(): Promise<BrowserSession> {
-  const cached = sessionFromEnv();
-  if (cached) return cached;
-  const session = await captureBrowserSession({ tradingSystem: "PaperMoney" });
-  saveSessionToDotEnv(session);
-  return session;
+/**
+ * A rejected login looks like `Login failed: …` from the client; anything else
+ * (a dead socket, DNS, …) is a transport problem that a browser login would not
+ * fix, so only the former triggers an interactive re-auth.
+ */
+function isAuthFailure(error: unknown): boolean {
+  const text = error instanceof Error ? error.message : String(error);
+  return /login failed|token|unauthor|expired|authenticat/i.test(text);
+}
+
+async function resolveSession(
+  forceLogin: boolean,
+  onLoginRequired: () => void,
+): Promise<BrowserSession> {
+  if (!forceLogin) {
+    const cached = sessionFromEnv();
+    if (cached) return cached;
+  }
+  onLoginRequired();
+  console.log(
+    "[feed] opening a browser for login — sign in, and switch the UI to paperMoney if it lands in live trading",
+  );
+  try {
+    const session = await captureBrowserSession({
+      tradingSystem: "PaperMoney",
+    });
+    saveSessionToDotEnv(session);
+    return session;
+  } catch (e) {
+    // A headless box, no Chrome, a cancelled login: say so plainly rather than
+    // dying with a puppeteer stack trace.
+    throw new Error(
+      `interactive login failed (${e instanceof Error ? e.message.split("\n")[0] : String(e)}). ` +
+        "Run `node dist/example/browserSession.js PaperMoney` on a machine with a display, " +
+        "or set PUPPETEER_EXECUTABLE_PATH to a browser.",
+    );
+  }
 }
 
 export async function startOrderFeedServer(port = 8787) {
-  const session = await resolveSession();
   const wss = new WebSocketServer({ host: "127.0.0.1", port });
+  let session: BrowserSession | undefined;
+  let client: RealWsJsonClient | undefined;
   const clients = new Set<WsSocket>();
   let connectionState = "connecting";
   let latestOrders: DisplayOrder[] = [];
@@ -87,7 +124,7 @@ export async function startOrderFeedServer(port = 8787) {
       JSON.stringify({
         type: "session",
         account: account ?? null,
-        tradingSystem: session.tradingSystem,
+        tradingSystem: session?.tradingSystem ?? null,
       }),
     );
     ws.send(
@@ -158,25 +195,27 @@ export async function startOrderFeedServer(port = 8787) {
       return reply(ws, { ok: false, command: kind, error: "not ready" });
     try {
       if (kind === "place") {
-        const result = await client.futuresOrderBuilder().place(
-          String(command.root ?? "/MES"),
-          {
-            accountNumber: account,
-            side: (command.side as "BUY" | "SELL") ?? "BUY",
-            quantity: Number(command.quantity ?? 1),
-            orderType: (command.orderType as never) ?? "LIMIT",
-            limitPrice:
-              command.limitPrice === undefined
-                ? undefined
-                : Number(command.limitPrice),
-            stopPrice:
-              command.stopPrice === undefined
-                ? undefined
-                : Number(command.stopPrice),
-            tif: (command.tif as never) ?? undefined,
-          },
-          { dryRun: command.dryRun === true },
-        );
+        const result = await active()
+          .futuresOrderBuilder()
+          .place(
+            String(command.root ?? "/MES"),
+            {
+              accountNumber: account,
+              side: (command.side as "BUY" | "SELL") ?? "BUY",
+              quantity: Number(command.quantity ?? 1),
+              orderType: (command.orderType as never) ?? "LIMIT",
+              limitPrice:
+                command.limitPrice === undefined
+                  ? undefined
+                  : Number(command.limitPrice),
+              stopPrice:
+                command.stopPrice === undefined
+                  ? undefined
+                  : Number(command.stopPrice),
+              tif: (command.tif as never) ?? undefined,
+            },
+            { dryRun: command.dryRun === true },
+          );
         console.log(
           `[feed] placed ${command.side} ${command.quantity} ${result.contract.symbol}`,
         );
@@ -190,7 +229,7 @@ export async function startOrderFeedServer(port = 8787) {
       }
       if (kind === "cancel") {
         const orderId = Number(command.orderId);
-        const res = await client.cancelOrder(orderId);
+        const res = await active().cancelOrder(orderId);
         console.log(`[feed] cancel ${orderId}`);
         void refreshDayHistory();
         return reply(ws, { ok: true, command: kind, result: res.body });
@@ -205,41 +244,75 @@ export async function startOrderFeedServer(port = 8787) {
 
   console.log(`[feed] serving ws://127.0.0.1:${port} — connecting…`);
 
-  const client = await RealWsJsonClient.create({
-    tradingSystem: session.tradingSystem,
-    gatewayUrl: session.gatewayUrl,
-    watchdog: {
-      onConnectionEvent: (event) => {
-        connectionState =
-          event.type === "connected" ? "connected" : event.type.toLowerCase();
-        broadcast({
-          type: "connection",
-          state: connectionState,
-          detail: event,
+  /** The client for the current session; replaced on every re-auth. */
+  const active = (): RealWsJsonClient => {
+    if (!client) throw new Error("no active session");
+    return client;
+  };
+
+  /** Resolves when the live session dies and needs rebuilding. */
+  let sessionEnded: (() => void) | undefined;
+
+  const setConnectionState = (state: string) => {
+    connectionState = state;
+    broadcast({ type: "connection", state });
+  };
+
+  /**
+   * Builds an authenticated client, opening a browser for an interactive login
+   * when the stored token is missing or the gateway rejects it.
+   */
+  const connect = async (): Promise<void> => {
+    for (let attempt = 0; ; attempt++) {
+      const forceLogin = attempt > 0;
+      session = await resolveSession(forceLogin, () =>
+        setConnectionState("authenticating"),
+      );
+      setConnectionState("connecting");
+      const candidate = await RealWsJsonClient.create({
+        tradingSystem: session.tradingSystem,
+        gatewayUrl: session.gatewayUrl,
+        watchdog: {
+          onConnectionEvent: (event) => {
+            setConnectionState(
+              event.type === "connected"
+                ? "connected"
+                : event.type.toLowerCase(),
+            );
+            console.log("[feed] connection:", JSON.stringify(event));
+            // Reconnects are exhausted: rebuild, re-authenticating if needed.
+            if (event.type === "gaveUp") sessionEnded?.();
+          },
+        },
+      });
+      try {
+        await candidate.authenticateWithAccessToken({
+          accessToken: session.accessToken,
+          refreshToken: session.refreshToken ?? "n/a",
         });
-        console.log("[feed] connection:", JSON.stringify(event));
-      },
-    },
-  });
-  await client.authenticateWithAccessToken({
-    accessToken: session.accessToken,
-    refreshToken: session.refreshToken ?? "n/a",
-  });
+        client = candidate;
+        return;
+      } catch (e) {
+        candidate.disconnect();
+        if (!isAuthFailure(e) || attempt >= 2) throw e;
+        console.warn(`[feed] login rejected (${String(e)}); re-authenticating`);
+      }
+    }
+  };
+
+  await connect();
+
   account =
-    session.accountCode ??
-    (await client.resolveAccountCode()) ??
+    session!.accountCode ??
+    (await client!.resolveAccountCode()) ??
     (() => {
       throw new Error("could not resolve an account code");
     })();
   console.log(
-    `[feed] ${session.tradingSystem} account ${account} — ready on ws://127.0.0.1:${port}`,
+    `[feed] ${session!.tradingSystem} account ${account} — ready on ws://127.0.0.1:${port}`,
   );
   // Clients that connected during login still have `account: null`.
   for (const ws of clients) sendSnapshot(ws);
-
-  console.log(
-    `[feed] serving ws://127.0.0.1:${port} — ${session.tradingSystem} account ${account}`,
-  );
 
   /**
    * Day history is a request/response service, so it is re-fetched rather than
@@ -250,8 +323,8 @@ export async function startOrderFeedServer(port = 8787) {
     if (!account) return;
     try {
       const [orders, trades] = await Promise.all([
-        client.orderHistory(account),
-        client.tradeHistory(account),
+        active().orderHistory(account),
+        active().tradeHistory(account),
       ]);
       latestDayOrders = orders;
       latestDayTrades = trades;
@@ -265,59 +338,94 @@ export async function startOrderFeedServer(port = 8787) {
     }
   };
 
-  await refreshDayHistory();
-
-  void (async () => {
-    for await (const ev of client.statement(account)) {
-      const values = (ev.body as { values?: Record<string, number> }).values;
-      if (!values) continue;
-      latestAccountValues = values;
-      broadcast({ type: "account", values, at: Date.now() });
-    }
-  })();
-
-  void (async () => {
-    for await (const ev of client.orderEvents(account)) {
-      const orders = (ev.body.orders ?? []) as Parameters<FillLog["apply"]>[0];
-      latestOrders = ordersFromEventsBody(ev.body);
-      broadcast({ type: "orders", orders: latestOrders, at: Date.now() });
-
-      // A marketable order can fill without ever appearing as WORKING, so the
-      // fill log is the only place that order becomes visible.
-      const before = latestFills.length;
-      latestFills = fillLog.apply(orders);
-      if (latestFills.length !== before) {
-        broadcast({ type: "fills", fills: latestFills, at: Date.now() });
+  const startSubscriptions = () => {
+    // account is always resolved before this runs.
+    const acct = account as string;
+    void (async () => {
+      for await (const ev of active().statement(acct)) {
+        const values = (ev.body as { values?: Record<string, number> }).values;
+        if (!values) continue;
+        latestAccountValues = values;
+        broadcast({ type: "account", values, at: Date.now() });
       }
-      console.log(
-        `[feed] ${latestOrders.length} working order(s), ${latestFills.length} fill(s)`,
-      );
-      // The live stream is the trigger; the gateway's own history is the truth.
-      void refreshDayHistory();
-    }
-  })();
+    })();
 
-  void (async () => {
-    for await (const ev of client.accountPositions(account)) {
-      latestPositions = positionsFromBody(ev.body);
-      broadcast({
-        type: "positions",
-        positions: latestPositions,
-        at: Date.now(),
+    void (async () => {
+      for await (const ev of active().orderEvents(acct)) {
+        const orders = (ev.body.orders ?? []) as Parameters<
+          FillLog["apply"]
+        >[0];
+        latestOrders = ordersFromEventsBody(ev.body);
+        broadcast({ type: "orders", orders: latestOrders, at: Date.now() });
+
+        // A marketable order can fill without ever appearing as WORKING, so the
+        // fill log is the only place that order becomes visible.
+        const before = latestFills.length;
+        latestFills = fillLog.apply(orders);
+        if (latestFills.length !== before) {
+          broadcast({ type: "fills", fills: latestFills, at: Date.now() });
+        }
+        console.log(
+          `[feed] ${latestOrders.length} working order(s), ${latestFills.length} fill(s)`,
+        );
+        // The live stream is the trigger; the gateway's own history is the truth.
+        void refreshDayHistory();
+      }
+    })();
+
+    void (async () => {
+      for await (const ev of active().accountPositions(acct)) {
+        latestPositions = positionsFromBody(ev.body);
+        broadcast({
+          type: "positions",
+          positions: latestPositions,
+          at: Date.now(),
+        });
+        console.log(`[feed] ${latestPositions.length} position(s)`);
+      }
+    })();
+  };
+
+  /**
+   * Supervises the session: subscribe, run until the watchdog gives up, then
+   * rebuild — re-authenticating through the browser if the token has expired.
+   */
+  const supervise = async () => {
+    for (;;) {
+      await refreshDayHistory();
+      startSubscriptions();
+      await new Promise<void>((resolve) => {
+        sessionEnded = resolve;
       });
-      console.log(`[feed] ${latestPositions.length} position(s)`);
+      console.log("[feed] session ended; rebuilding");
+      client?.disconnect();
+      client = undefined;
+      try {
+        await connect();
+        account =
+          session!.accountCode ??
+          (await active().resolveAccountCode()) ??
+          account;
+        for (const ws of clients) sendSnapshot(ws);
+      } catch (e) {
+        console.error("[feed] could not re-establish a session:", String(e));
+        setConnectionState("gaveUp");
+        return;
+      }
     }
-  })();
+  };
+
+  void supervise();
 
   const shutdown = () => {
     console.log("[feed] shutting down");
-    client.disconnect();
+    client?.disconnect();
     wss.close();
     process.exit(0);
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
-  return { client, wss };
+  return { wss };
 }
 
 if (process.argv[1]?.endsWith("orderFeedServer.js")) {
