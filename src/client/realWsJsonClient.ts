@@ -13,6 +13,7 @@ import {
 } from "./messageTypeHelpers.js";
 import ResponseParser from "./responseParser.js";
 import AlertLookupMessageHandler from "./services/alertLookupMessageHandler.js";
+import { ApiService } from "./services/apiService.js";
 import CancelAlertMessageHandler from "./services/cancelAlertMessageHandler.js";
 import CancelOrderMessageHandler from "./services/cancelOrderMessageHandler.js";
 import ChartMessageHandler, {
@@ -51,9 +52,14 @@ import WebSocketApiMessageHandler from "./services/webSocketApiMessageHandler.js
 import WorkingOrdersMessageHandler from "./services/workingOrdersMessageHandler.js";
 import {
   ParsedPayloadResponse,
+  RawPayloadRequest,
   RawPayloadResponse,
   WsJsonRawMessage,
 } from "./tdaWsJsonTypes.js";
+import {
+  PaperMoneyFuturesLimitOrder,
+  PaperMoneyFuturesOrderBuilder,
+} from "./orders/paperMoneyFuturesOrderBuilder.js";
 import {
   Constructor,
   debugLog,
@@ -73,6 +79,8 @@ export const LIVE_WS_JSON_URL =
   "wss://thinkorswim-services.schwab.com/Services/WsJson";
 export const PAPER_MONEY_WS_JSON_URL =
   "wss://papermoney-services.schwab.com/Services/WsJson";
+
+export type WsJsonEnvironment = "live" | "paperMoney";
 
 export enum ChannelState {
   DISCONNECTED,
@@ -135,11 +143,16 @@ export class RealWsJsonClient implements WsJsonClient {
   constructor(
     private readonly socket = createSocket(LIVE_WS_JSON_URL),
     private readonly responseParser = new ResponseParser(this.genericHandler),
+    private readonly environment: WsJsonEnvironment = "live",
   ) {}
 
   /** Creates a client that connects only to the paperMoney service. */
   static forPaperMoney(): RealWsJsonClient {
-    return new RealWsJsonClient(createSocket(PAPER_MONEY_WS_JSON_URL));
+    return new RealWsJsonClient(
+      createSocket(PAPER_MONEY_WS_JSON_URL),
+      undefined,
+      "paperMoney",
+    );
   }
 
   get accessToken() {
@@ -194,8 +207,26 @@ export class RealWsJsonClient implements WsJsonClient {
         this.sendMessage(CONNECTION_REQUEST_MESSAGE);
       }
       socket.onopen = () => this.sendMessage(CONNECTION_REQUEST_MESSAGE);
-      socket.onclose = (event) =>
+      socket.onerror = () => {
+        if (this.state === ChannelState.CONNECTING) {
+          this.state = ChannelState.ERROR;
+          reject(
+            new Error("WebSocket connection failed during authentication."),
+          );
+        }
+      };
+      socket.onclose = (event) => {
         debugLog("connection closed: ", event?.reason);
+        if (this.state === ChannelState.CONNECTING) {
+          this.state = ChannelState.ERROR;
+          const reason = event.reason ? `: ${event.reason}` : "";
+          reject(
+            new Error(
+              `WebSocket closed during authentication${reason} (code ${String(event.code)}).`,
+            ),
+          );
+        }
+      };
       socket.onmessage = ({ data }) =>
         this.onMessage(data as string, resolve, reject);
     });
@@ -325,6 +356,23 @@ export class RealWsJsonClient implements WsJsonClient {
     return this.dispatchHandler(SubmitOrderMessageHandler, request).promise();
   }
 
+  /**
+   * Sends a paperMoney futures draft for confirmation without submitting it.
+   */
+  confirmPaperMoneyFuturesOrder(
+    order: PaperMoneyFuturesLimitOrder,
+  ): Promise<ParsedPayloadResponse> {
+    if (this.environment !== "paperMoney") {
+      throw new Error(
+        "Futures confirmation is only available from RealWsJsonClient.forPaperMoney().",
+      );
+    }
+    const request = new PaperMoneyFuturesOrderBuilder(
+      order,
+    ).buildConfirmationRequest();
+    return this.dispatchRawRequest(request, "place_order").promise();
+  }
+
   replaceOrder(
     request: Required<PlaceLimitOrderRequestParams>,
   ): Promise<ParsedPayloadResponse> {
@@ -376,6 +424,17 @@ export class RealWsJsonClient implements WsJsonClient {
     this.sendMessage(handler.buildRequest(args));
     return deferredWrap(() => this.iterator).filter(
       (msg) => msg.service === handler.service,
+    ) as Observable<NonNullable<ParsedPayloadResponse>>;
+  }
+
+  private dispatchRawRequest(
+    request: RawPayloadRequest,
+    service: ApiService,
+  ): Observable<NonNullable<ParsedPayloadResponse>> {
+    this.ensureConnected();
+    this.sendMessage(request);
+    return deferredWrap(() => this.iterator).filter(
+      (message) => message.service === service,
     ) as Observable<NonNullable<ParsedPayloadResponse>>;
   }
 

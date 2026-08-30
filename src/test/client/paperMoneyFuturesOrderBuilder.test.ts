@@ -2,6 +2,7 @@ import {
   PaperMoneyFuturesOrderBuilder,
   PaperMoneyFuturesLimitOrder,
 } from "../../client/orders/paperMoneyFuturesOrderBuilder";
+import { RealWsJsonClient } from "../../client/realWsJsonClient";
 
 const order: PaperMoneyFuturesLimitOrder = {
   accountNumber: "123456789",
@@ -13,6 +14,14 @@ const order: PaperMoneyFuturesLimitOrder = {
 };
 
 describe("PaperMoneyFuturesOrderBuilder", () => {
+  it("refuses paperMoney confirmation from a live client", () => {
+    const client = new RealWsJsonClient({ close: jest.fn() } as never);
+    expect(() => client.confirmPaperMoneyFuturesOrder(order)).toThrow(
+      "RealWsJsonClient.forPaperMoney()",
+    );
+    client.disconnect();
+  });
+
   it("builds the paperMoney futures confirmation payload", () => {
     const request = new PaperMoneyFuturesOrderBuilder(
       order,
